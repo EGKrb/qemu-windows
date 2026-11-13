@@ -919,6 +919,20 @@ void qemu_win32_map_free(void *ptr, HANDLE h, Error **errp)
  * which tells the guards of sealed memfds (qemu-memfd-guard watches the
  * directory) that it ended, whoever closed it.
  */
+void qemu_exit_debug(const char *step)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("QEMU_EXIT_DEBUG") != NULL;
+    }
+    if (on) {
+        fprintf(stderr, "exit %.3f: %s\n", g_get_monotonic_time() / 1000.0,
+                step);
+        fflush(stderr);
+    }
+}
+
 int qemu_shm_alloc(size_t size, Error **errp)
 {
     static int sequence;

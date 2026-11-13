@@ -1155,6 +1155,7 @@ void qemu_cleanup(int status)
 
 
     /* No more vcpu or device emulation activity beyond this point */
+    qemu_exit_debug("vm_shutdown");
     vm_shutdown();
     replay_finish();
 
@@ -1167,15 +1168,21 @@ void qemu_cleanup(int status)
      * We do not need to end this section, because we do not want any
      * requests happening from here on anyway.
      */
+    qemu_exit_debug("block");
     bdrv_drain_all_begin();
     job_cancel_sync_all();
     bdrv_close_all();
 
     /* vhost-user must be cleaned up before chardevs.  */
+    qemu_exit_debug("tpm");
     tpm_cleanup();
+    qemu_exit_debug("net");
     net_cleanup();
+    qemu_exit_debug("audio");
     audio_cleanup();
+    qemu_exit_debug("monitor");
     monitor_cleanup();
+    qemu_exit_debug("rest of the cleanup");
     qemu_chr_cleanup();
     qemu_display_cleanup();
     user_creatable_cleanup();

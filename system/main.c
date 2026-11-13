@@ -48,10 +48,13 @@ static void *qemu_default_main(void *opaque)
     replay_mutex_lock();
     bql_lock();
     status = qemu_main_loop();
+    qemu_exit_debug("main loop done");
     qemu_cleanup(status);
+    qemu_exit_debug("cleanup done");
     bql_unlock();
     replay_mutex_unlock();
 
+    qemu_exit_debug("exit()");
     exit(status);
 }
 

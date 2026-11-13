@@ -631,16 +631,23 @@ static tap_win32_overlapped_t *tap_win32_start(HANDLE handle, Error **errp)
 
 static void tap_win32_stop(tap_win32_overlapped_t *ov)
 {
+    qemu_exit_debug("tap: stop the reader");
     ov->stopping = true;
     CancelIoEx(ov->handle, NULL);
     /* a thread waiting for a free buffer */
     ReleaseSemaphore(ov->free_list_semaphore, 1, NULL);
     if (ov->thread) {
-        WaitForSingleObject(ov->thread, 5000);
+        DWORD w = WaitForSingleObject(ov->thread, 5000);
+
+        qemu_exit_debug(w == WAIT_OBJECT_0 ? "tap: reader ended"
+                                           : "tap: reader still running");
         CloseHandle(ov->thread);
     }
+    qemu_exit_debug("tap: media status");
     tap_win32_set_status(ov->handle, FALSE);
+    qemu_exit_debug("tap: close the device");
     CloseHandle(ov->handle);
+    qemu_exit_debug("tap: device closed");
     CloseHandle(ov->read_event);
     CloseHandle(ov->write_event);
     CloseHandle(ov->output_queue_semaphore);

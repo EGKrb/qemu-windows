@@ -888,6 +888,16 @@ static inline int platform_does_not_support_system(const char *command)
 }
 #endif /* !HAVE_SYSTEM_FUNCTION */
 
+/*
+ * QEMU_EXIT_DEBUG=1: the steps of the exit of QEMU on stderr (Windows,
+ * to find where an exit waits)
+ */
+#ifdef _WIN32
+void qemu_exit_debug(const char *step);
+#else
+static inline void qemu_exit_debug(const char *step) {}
+#endif
+
 #ifdef __cplusplus
 }
 #endif
