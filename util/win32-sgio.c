@@ -218,61 +218,6 @@ static bool sg_debug(void)
     return on;
 }
 
-/* PERSISTENT_RESERVE_COMMAND of ntddstor.h for PR OUT (MSVC layout) */
-typedef struct {
-    ULONG Version;
-    ULONG Size;
-    UCHAR ServiceAction;    /* 5 bits */
-    UCHAR TypeScope;        /* type: 4 low bits, scope: 4 high bits */
-    UCHAR ParameterList[64];
-} PROutCommand;
-
-/*
- * PERSISTENT RESERVE OUT through IOCTL_STORAGE_PERSISTENT_RESERVE_OUT, the
- * way of Windows for reservations (QEMU_SG_PR_OUT=storage)
- */
-static int sg_pr_out_storage(HANDLE h, sg_io_hdr_t *hdr)
-{
-    PROutCommand cmd = { 0 };
-    size_t len = MIN(hdr->dxfer_len, sizeof(cmd.ParameterList));
-    DWORD ret = 0, err = 0;
-    BOOL ok;
-
-    cmd.Version = 12;   /* sizeof(PERSISTENT_RESERVE_COMMAND) */
-    cmd.Size = 12;
-    cmd.ServiceAction = hdr->cmdp[1] & 0x1f;
-    cmd.TypeScope = (hdr->cmdp[2] & 0x0f) | (hdr->cmdp[2] & 0xf0);
-    if (hdr->iovec_count) {
-        copy_data(hdr, cmd.ParameterList, len, false);
-    } else {
-        memcpy(cmd.ParameterList, hdr->dxferp, len);
-    }
-    ok = ioctl_wait(h, IOCTL_STORAGE_PERSISTENT_RESERVE_OUT, &cmd,
-                    offsetof(PROutCommand, ParameterList) + len, NULL, 0,
-                    &ret);
-    if (!ok) {
-        err = GetLastError();
-    }
-    if (sg_debug()) {
-        fprintf(stderr, "sg: PR OUT storage sa %u type/scope %02x: ok %d "
-                "error %lu\n", cmd.ServiceAction, cmd.TypeScope, ok,
-                (unsigned long)err);
-    }
-    memset(&hdr->status, 0, offsetof(sg_io_hdr_t, info) -
-           offsetof(sg_io_hdr_t, status) + sizeof(hdr->info));
-    if (!ok) {
-        if (err == ERROR_BUSY || err == ERROR_SHARING_VIOLATION) {
-            /* classpnp: RESERVATION CONFLICT is STATUS_DEVICE_BUSY */
-            hdr->status = 0x18;
-            hdr->masked_status = 0x0c;
-            hdr->info = SG_INFO_CHECK;
-            return 0;
-        }
-        return -errno_of(err);
-    }
-    return 0;
-}
-
 static int sg_io(HANDLE h, sg_io_hdr_t *hdr)
 {
     SPTDWithSense s = { 0 };
@@ -333,11 +278,6 @@ static int sg_io(HANDLE h, sg_io_hdr_t *hdr)
     }
     memcpy(s.sptd.Cdb, hdr->cmdp, hdr->cmd_len);
 
-    if (hdr->cmdp[0] == 0x5f && getenv("QEMU_SG_PR_OUT") &&
-        !strcmp(getenv("QEMU_SG_PR_OUT"), "storage")) {
-        qemu_vfree(buf);
-        return sg_pr_out_storage(h, hdr);
-    }
     start = GetTickCount64();
     ok = ioctl_wait(h, IOCTL_SCSI_PASS_THROUGH_DIRECT, &s, sizeof(s),
                     &s, sizeof(s), &ret);

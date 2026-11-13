@@ -69,6 +69,28 @@ static void dbg(const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+/* The process that started us (QEMU) */
+static DWORD parent_pid(void)
+{
+    typedef LONG (NTAPI *QueryFn)(HANDLE, int, PVOID, ULONG, PULONG);
+    struct {
+        PVOID reserved1;
+        PVOID peb;
+        PVOID reserved2[2];
+        ULONG_PTR pid;
+        ULONG_PTR parent;
+    } info;
+    QueryFn query = (QueryFn)(void *)GetProcAddress(
+        GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+    ULONG len;
+
+    if (!query || query(GetCurrentProcess(), 0 /* basic */, &info,
+                        sizeof(info), &len) < 0) {
+        return 0;
+    }
+    return (DWORD)info.parent;
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -313,23 +335,34 @@ int main(int argc, char **argv)
         DWORD n = 1, pid = 0, bytes;
         char c;
 
+        /*
+         * QEMU: the peer of the socket, else our parent (QEMU starts us)
+         */
         if (WSAIoctl(sock, SIO_AF_UNIX_GETPEERPID, NULL, 0, &pid, sizeof(pid),
-                     &bytes, NULL, NULL) == 0 && pid) {
-            hs[1] = OpenProcess(SYNCHRONIZE, FALSE, pid);
-            if (hs[1]) {
-                n = 2;
-            }
+                     &bytes, NULL, NULL) != 0 || !pid) {
+            dbg("peer pid: wsa error %d", WSAGetLastError());
+            pid = parent_pid();
+        }
+        hs[1] = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+        dbg("waiting for QEMU %lu (process handle %p, error %lu)", pid,
+            hs[1], hs[1] ? 0 : GetLastError());
+        if (hs[1]) {
+            n = 2;
         }
         WSAEventSelect(sock, ev, FD_READ | FD_CLOSE);
         for (;;) {
-            if (WaitForMultipleObjects(n, hs, FALSE, INFINITE) !=
-                WAIT_OBJECT_0) {
-                break;
-            }
+            DWORD w = WaitForMultipleObjects(n, hs, FALSE, INFINITE);
             int r;
 
+            if (w != WAIT_OBJECT_0) {
+                dbg("woken: %s", w == WAIT_OBJECT_0 + 1 ? "QEMU ended"
+                                                          : "wait failed");
+                break;
+            }
             WSAResetEvent(ev);
             r = recv(sock, &c, 1, 0);
+            dbg("woken by the socket: recv %d, wsa %d", r,
+                r < 0 ? WSAGetLastError() : 0);
             if (r == 0 || (r < 0 && WSAGetLastError() != WSAEWOULDBLOCK)) {
                 break;
             }
