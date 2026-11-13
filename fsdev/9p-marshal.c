@@ -13,8 +13,10 @@
 
 #include "qemu/osdep.h"
 #include <glib/gprintf.h>
+#ifndef _WIN32
 #include <dirent.h>
 #include <utime.h>
+#endif
 
 #include "9p-marshal.h"
 

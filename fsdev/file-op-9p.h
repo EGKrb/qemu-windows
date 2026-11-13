@@ -14,8 +14,12 @@
 #ifndef FILE_OP_9P_H
 #define FILE_OP_9P_H
 
+#ifdef _WIN32
+#include "9p-win32.h"
+#else
 #include <dirent.h>
 #include <utime.h>
+#endif
 #include "qemu-fsdev-throttle.h"
 #include "p9array.h"
 

@@ -13,7 +13,9 @@
 
 #include "qemu/osdep.h"
 #include <glib/gprintf.h>
+#ifndef _WIN32
 #include <utime.h>
+#endif
 
 #include "9p-iov-marshal.h"
 #include "qemu/bswap.h"

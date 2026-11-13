@@ -69,7 +69,7 @@ Windows does not have; what replaces it, if anything).
 
 | Feature | Windows |
 | --- | --- |
-| virtio-9p (`-virtfs`) | **todo** (NTFS, EAs for the mapped security models) |
+| virtio-9p (`-virtfs`, `-fsdev local`) | **done**, every security model: the `*at()` functions on NT's relative opens (`NtCreateFile` with a root directory), POSIX renames and deletions (a file deleted while open, as on Linux), owner/mode/device as WSL keeps them (`$LXUID`, `$LXGID`, `$LXMOD`, `$LXDEV`), symbolic links, FIFOs, sockets and device nodes as WSL's reparse points (no privilege), extended attributes as NTFS EAs, names NTFS refuses mapped to U+F0xx as WSL and Cygwin do, directories made by the guest case sensitive |
 | TPM (`tpm-emulator`, `tpm-passthrough`) | **todo** |
 | vfio, iommufd, vfio-user | **no** |
 | `input-linux`, `can-host-socketcan`, `pr-manager-helper` | **no** / **no** / **todo** (SCSI pass-through) |

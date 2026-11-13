@@ -4184,6 +4184,9 @@ out_nofid:
  * Linux guests.
  */
 #define P9_XATTR_SIZE_MAX 65536
+#elif defined(_WIN32)
+/* NTFS keeps at most 64 KiB of extended attributes per file */
+#define P9_XATTR_SIZE_MAX 65536
 #elif defined(CONFIG_FREEBSD)
 /*
  * FreeBSD similarly doesn't define a maximum xattr size, the limit is
@@ -4575,6 +4578,14 @@ void v9fs_reset(V9fsState *s)
     }
 }
 
+#ifdef _WIN32
+static void __attribute__((__constructor__)) v9fs_set_fd_limit(void)
+{
+    /* the descriptors of the C runtime: 8192 at most */
+    open_fd_hw = 8192 - 400;
+    open_fd_rc = 8192 / 2;
+}
+#else
 static void __attribute__((__constructor__)) v9fs_set_fd_limit(void)
 {
     struct rlimit rlim;
@@ -4585,3 +4596,4 @@ static void __attribute__((__constructor__)) v9fs_set_fd_limit(void)
     open_fd_hw = rlim.rlim_cur - MIN(400, rlim.rlim_cur / 3);
     open_fd_rc = rlim.rlim_cur / 2;
 }
+#endif

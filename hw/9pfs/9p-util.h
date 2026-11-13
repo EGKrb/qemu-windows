@@ -14,6 +14,9 @@
 #define QEMU_9P_UTIL_H
 
 #include "qemu/error-report.h"
+#ifdef _WIN32
+#include "fsdev/9p-win32.h"
+#endif
 
 #ifdef O_PATH
 #define O_PATH_9P_UTIL O_PATH
@@ -73,6 +76,37 @@ static inline uint64_t host_dev_to_dotl_dev(dev_t dev)
 static inline int errno_to_dotl(int err) {
 #if defined(CONFIG_LINUX)
     /* nothing to translate (Linux -> Linux) */
+#elif defined(_WIN32)
+    /* the errno values of the C runtime of Windows differ from Linux */
+    switch (err) {
+    case EDEADLK:
+        return 35;
+    case ENAMETOOLONG:
+        return 36;
+    case ENOLCK:
+        return 37;
+    case ENOSYS:
+        return 38;
+    case ENOTEMPTY:
+        return 39;
+    case ELOOP:
+        return 40;
+    case ENODATA:
+        return 61;
+    case EOVERFLOW:
+        return 75;
+    case EILSEQ:
+        return 84;
+    case ENOTSUP:
+    case EOPNOTSUPP:
+        return 95;
+    case ETIMEDOUT:
+        return 110;
+    case ECANCELED:
+        return 125;
+    case ETXTBSY:
+        return 26;
+    }
 #elif defined(CONFIG_DARWIN) || defined(CONFIG_FREEBSD)
     /*
      * translation mandatory for non-Linux hosts

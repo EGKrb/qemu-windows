@@ -21,25 +21,31 @@
 #include "9p-xattr.h"
 #include "9p-util.h"
 #include "fsdev/qemu-fsdev.h"   /* local_ops */
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <pwd.h>
 #include <grp.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#endif
 #include "qemu/xattr.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/option.h"
+#ifndef _WIN32
 #include <libgen.h>
+#endif
 #ifdef CONFIG_LINUX
 #include <linux/fs.h>
 #ifdef CONFIG_LINUX_MAGIC_H
 #include <linux/magic.h>
 #endif
 #endif
+#ifndef _WIN32
 #include <sys/ioctl.h>
+#endif
 
 #ifndef XFS_SUPER_MAGIC
 #define XFS_SUPER_MAGIC  0x58465342
@@ -138,7 +144,11 @@ static FILE *local_fopenat(int dirfd, const char *name, const char *mode)
     if (fd == -1) {
         return NULL;
     }
+#ifdef _WIN32
+    fp = fdopen(fd, mode[0] == 'r' ? "rb" : "wb");
+#else
     fp = fdopen(fd, mode);
+#endif
     if (!fp) {
         close(fd);
     }
@@ -348,6 +358,17 @@ static int fchmodat_nofollow(int dirfd, const char *name, mode_t mode)
     /* FIXME: this should be handled with fchmodat(AT_SYMLINK_NOFOLLOW).
      * Unfortunately, the linux kernel doesn't implement it yet.
      */
+#ifdef _WIN32
+    /* the fchmodat() of Windows (9p-util-win32.c) does not follow links */
+    if (qemu_fstatat(dirfd, name, &stbuf, AT_SYMLINK_NOFOLLOW)) {
+        return -1;
+    }
+    if (S_ISLNK(stbuf.st_mode)) {
+        errno = ELOOP;
+        return -1;
+    }
+    return fchmodat(dirfd, name, mode, AT_SYMLINK_NOFOLLOW);
+#endif
 
      /* First, we clear non-racing symlinks out of the way. */
     if (qemu_fstatat(dirfd, name, &stbuf, AT_SYMLINK_NOFOLLOW)) {
@@ -597,7 +618,9 @@ static ssize_t local_preadv(FsContext *ctx, V9fsFidOpenState *fs,
                             const struct iovec *iov,
                             int iovcnt, off_t offset)
 {
-#ifdef CONFIG_PREADV
+#ifdef _WIN32
+    return p9_preadv(fs->fd, iov, iovcnt, offset);
+#elif defined(CONFIG_PREADV)
     return preadv(fs->fd, iov, iovcnt, offset);
 #else
     int err = lseek(fs->fd, offset, SEEK_SET);
@@ -614,7 +637,9 @@ static ssize_t local_pwritev(FsContext *ctx, V9fsFidOpenState *fs,
                              int iovcnt, off_t offset)
 {
     ssize_t ret;
-#ifdef CONFIG_PREADV
+#ifdef _WIN32
+    ret = p9_pwritev(fs->fd, iov, iovcnt, offset);
+#elif defined(CONFIG_PREADV)
     ret = pwritev(fs->fd, iov, iovcnt, offset);
 #else
     int err = lseek(fs->fd, offset, SEEK_SET);
@@ -1471,7 +1496,11 @@ static int local_init(FsContext *ctx, Error **errp)
 {
     LocalData *data = g_malloc(sizeof(*data));
 
+#ifdef _WIN32
+    data->mountfd = openat(AT_FDCWD, ctx->fs_root, O_DIRECTORY | O_RDONLY);
+#else
     data->mountfd = open(ctx->fs_root, O_DIRECTORY | O_RDONLY);
+#endif
     if (data->mountfd == -1) {
         error_setg_file_open(errp, errno, ctx->fs_root);
         goto err;

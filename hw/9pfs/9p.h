@@ -1,9 +1,11 @@
 #ifndef QEMU_9P_H
 #define QEMU_9P_H
 
+#ifndef _WIN32
 #include <dirent.h>
 #include <utime.h>
 #include <sys/resource.h>
+#endif
 #include "fsdev/file-op-9p.h"
 #include "fsdev/9p-iov-marshal.h"
 #include "qemu/thread.h"
