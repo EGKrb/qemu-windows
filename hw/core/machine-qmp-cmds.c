@@ -350,6 +350,11 @@ KvmInfo *qmp_query_kvm(Error **errp)
 
     info->enabled = kvm_enabled();
     info->present = accel_find("kvm");
+#ifdef _WIN32
+    /* "kvm" is WHPX on Windows (accel_find()) */
+    info->enabled = info->enabled ||
+                    g_str_equal(current_accel_name() ?: "", "whpx");
+#endif
 
     return info;
 }
