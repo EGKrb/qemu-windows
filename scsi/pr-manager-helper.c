@@ -29,6 +29,27 @@
 #include "qom/object.h"
 
 #define PR_MAX_RECONNECT_ATTEMPTS 5
+#define PR_DBG_WHO "pr-manager"
+
+/* QEMU_PR_DEBUG=1: each step of the protocol with the helper, on stderr */
+static void G_GNUC_PRINTF(1, 2) pr_dbg(const char *fmt, ...)
+{
+    static int on = -1;
+    va_list ap;
+
+    if (on < 0) {
+        on = getenv("QEMU_PR_DEBUG") != NULL;
+    }
+    if (!on) {
+        return;
+    }
+    fprintf(stderr, "%s %.3f: ", PR_DBG_WHO,
+            g_get_monotonic_time() / 1000.0);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
 
 #define TYPE_PR_MANAGER_HELPER "pr-manager-helper"
 
@@ -209,7 +230,9 @@ static int pr_manager_helper_run(PRManager *p,
             }
         }
 
+        pr_dbg("send cdb %02x %02x", cdb[0], cdb[1]);
         ret = pr_manager_helper_write(pr_mgr, fd, cdb, ARRAY_SIZE(cdb), NULL);
+        pr_dbg("sent cdb: %d", ret);
         if (ret >= 0) {
             break;
         }
@@ -225,11 +248,14 @@ static int pr_manager_helper_run(PRManager *p,
     if (expected_dir == SG_DXFER_TO_DEV) {
         io_hdr->resid = io_hdr->dxfer_len - len;
         ret = pr_manager_helper_write(pr_mgr, -1, io_hdr->dxferp, len, NULL);
+        pr_dbg("sent %u bytes of parameters: %d", len, ret);
         if (ret < 0) {
             goto out;
         }
     }
     ret = pr_manager_helper_read(pr_mgr, &resp, sizeof(resp), NULL);
+    pr_dbg("read the response: %d, result %u, %u bytes", ret,
+           be32_to_cpu(resp.result), be32_to_cpu(resp.sz));
     if (ret < 0) {
         goto out;
     }

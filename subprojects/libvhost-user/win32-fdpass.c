@@ -248,6 +248,7 @@ ssize_t w32fd_recv(SOCKET s, W32FdState *st, const struct iovec *iov_,
 {
     const struct iovec_w32 *iov = (const struct iovec_w32 *)iov_;
     size_t done = 0;
+    bool frame_new = false;     /* we took the header of a frame here */
     int i;
 
     if (nitems) {
@@ -318,6 +319,7 @@ ssize_t w32fd_recv(SOCKET s, W32FdState *st, const struct iovec *iov_,
             }
         }
         st->frame_left = hdr.data_len;
+        frame_new = true;
         if (hdr.data_len == 0) {
             /* items go with data: w32fd_send() never makes such frames */
             errno = EPROTO;
@@ -343,10 +345,17 @@ ssize_t w32fd_recv(SOCKET s, W32FdState *st, const struct iovec *iov_,
         }
         if (n == SOCKET_ERROR) {
             if (WSAGetLastError() == WSAEWOULDBLOCK) {
-                if (done || (nitems && *nitems)) {
+                if (done) {
                     break;
                 }
-                if (nonblock) {
+                /*
+                 * A frame whose header (and handles) we took in this call
+                 * but whose data did not come yet: it comes, the sender
+                 * writes frames whole; wait for it, even when non-blocking
+                 * (returning 0 would read as the end of the stream, and
+                 * EAGAIN would lose the handles)
+                 */
+                if (nonblock && !frame_new) {
                     errno = EAGAIN;
                     return -1;
                 }

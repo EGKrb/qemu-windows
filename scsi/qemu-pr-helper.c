@@ -73,6 +73,28 @@
 
 #define PR_OUT_FIXED_PARAM_SIZE 24
 
+#define PR_DBG_WHO "pr-helper"
+
+/* QEMU_PR_DEBUG=1: each step of the protocol with the helper, on stderr */
+static void G_GNUC_PRINTF(1, 2) pr_dbg(const char *fmt, ...)
+{
+    static int on = -1;
+    va_list ap;
+
+    if (on < 0) {
+        on = getenv("QEMU_PR_DEBUG") != NULL;
+    }
+    if (!on) {
+        return;
+    }
+    fprintf(stderr, "%s %.3f: ", PR_DBG_WHO,
+            g_get_monotonic_time() / 1000.0);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
 static char *socket_path;
 static char *pidfile;
 static enum { RUNNING, TERMINATE, TERMINATING } state;
@@ -942,7 +964,9 @@ static void coroutine_fn prh_co_entry(void *opaque)
         PRHelperResponse resp;
         int sz;
 
+        pr_dbg("waiting for a request");
         sz = prh_read_request(client, &req, &resp, &local_err);
+        pr_dbg("request %02x %02x: %d", req.cdb[0], req.cdb[1], sz);
         if (sz < 0) {
             break;
         }
@@ -975,8 +999,10 @@ static void coroutine_fn prh_co_entry(void *opaque)
         resp.result = r;
 
         if (prh_write_response(client, &req, &resp, &local_err) < 0) {
+            pr_dbg("response not written");
             break;
         }
+        pr_dbg("response written: result %d", r);
     }
 
 out:
