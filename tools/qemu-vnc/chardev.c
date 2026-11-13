@@ -34,7 +34,7 @@ on_chardev_register_finished(GObject *source_object,
     QemuTextConsole *tc;
 
     if (!qemu_dbus_display1_chardev_call_register_finish(
-            data->proxy, NULL, res, &err)) {
+            data->proxy, PEER_NO_FD_LIST res, &err)) {
         error_report("Chardev Register failed for %s: %s",
                      data->name, err->message);
         close(data->local_fd);
@@ -70,11 +70,10 @@ static void
 chardev_register(QemuDBusDisplay1Chardev *proxy,
                  ChardevVCEncoding encoding)
 {
-    g_autoptr(GUnixFDList) fd_list = NULL;
     ChardevRegisterData *data;
     const char *name;
+    PeerSocket ps;
     int pair[2];
-    int idx;
 
     name = qemu_dbus_display1_chardev_get_name(proxy);
     if (!name || !g_strv_contains(names, name)) {
@@ -86,9 +85,10 @@ chardev_register(QemuDBusDisplay1Chardev *proxy,
         return;
     }
 
-    fd_list = g_unix_fd_list_new();
-    idx = g_unix_fd_list_append(fd_list, pair[1], NULL);
-    close(pair[1]);
+    if (!peer_socket_prepare(G_DBUS_PROXY(proxy), pair[1], &ps)) {
+        close(pair[0]);
+        return;
+    }
 
     data = g_new0(ChardevRegisterData, 1);
     data->proxy = g_object_ref(proxy);
@@ -98,10 +98,11 @@ chardev_register(QemuDBusDisplay1Chardev *proxy,
     data->encoding = encoding;
 
     qemu_dbus_display1_chardev_call_register(
-        proxy, g_variant_new_handle(idx),
+        proxy, ps.arg,
         G_DBUS_CALL_FLAGS_NONE, -1,
-        fd_list, NULL,
+        PEER_FD_LIST(ps) NULL,
         on_chardev_register_finished, data);
+    peer_socket_clear(&ps);
 }
 
 void chardev_setup(const char * const *chardev_names,

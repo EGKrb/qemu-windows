@@ -2,6 +2,7 @@
 
 from pathlib import PurePath
 import errno
+import shutil
 import json
 import os
 import shlex
@@ -30,8 +31,11 @@ for source, dest in json.loads(out).items():
     except BaseException as e:
         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
             if os.name == 'nt':
-                # Local Windows build: qemu-bundle is optional, use "ninja install"
-                print('Skipping qemu-bundle (no symlink privilege)', file=sys.stderr)
-                sys.exit(0)
+                # No symlink privilege: copy the files that exist already
+                # (the sources: keymaps, firmware); "ninja install" for the
+                # rest
+                if os.path.isfile(source):
+                    shutil.copy2(source, bundle_dest)
+                continue
             print(f'error making symbolic link {dest}', file=sys.stderr)
             raise e

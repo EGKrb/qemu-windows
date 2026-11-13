@@ -2331,8 +2331,6 @@ have_qemu_vnc = get_option('qemu_vnc') \
            error_message: 'qemu-vnc requires dbus-display support') \
   .require(vnc.found(),
            error_message: 'qemu-vnc requires vnc support') \
-  .require(host_os != 'windows',
-           error_message: 'qemu-vnc is not currently supported on Windows') \
   .allowed()
 
 have_virtfs = get_option('virtfs') \
@@ -2542,7 +2540,8 @@ config_host_data.set('CONFIG_ZSTD', zstd.found())
 config_host_data.set('CONFIG_QPL', qpl.found())
 config_host_data.set('CONFIG_UADK', uadk.found())
 config_host_data.set('CONFIG_QATZIP', qatzip.found())
-config_host_data.set('CONFIG_FUSE', fuse.found())
+# Windows: the FUSE export uses WinFsp, loaded at run time
+config_host_data.set('CONFIG_FUSE', fuse.found() or host_os == 'windows')
 config_host_data.set('CONFIG_FUSE_LSEEK', fuse_lseek.found())
 config_host_data.set('CONFIG_SPICE_PROTOCOL', spice_protocol.found())
 if spice_protocol.found()

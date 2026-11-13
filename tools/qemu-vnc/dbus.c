@@ -242,6 +242,46 @@ on_reload_certificates(QemuVnc1Server *iface,
     return TRUE;
 }
 
+#ifdef G_OS_WIN32
+/* The socket is the WSAPROTOCOL_INFOW the caller made for this process */
+static gboolean
+on_add_client(QemuVnc1Server *iface,
+              GDBusMethodInvocation *invocation,
+              GVariant *arg_socket,
+              gboolean skipauth,
+              gpointer user_data)
+{
+    gsize n;
+    WSAPROTOCOL_INFOW *info = (void *)g_variant_get_fixed_array(arg_socket,
+                                                                &n, 1);
+    SOCKET s;
+    int fd;
+
+    if (!info || n != sizeof(*info)) {
+        g_dbus_method_invocation_return_error(
+            invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+            "Failed to get the socket informations");
+        return TRUE;
+    }
+    s = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
+                   FROM_PROTOCOL_INFO, info, 0, 0);
+    if (s == INVALID_SOCKET ||
+        (fd = _open_osfhandle((intptr_t)s, _O_BINARY)) < 0) {
+        if (s != INVALID_SOCKET) {
+            closesocket(s);
+        }
+        g_dbus_method_invocation_return_error(
+            invocation, G_DBUS_ERROR, G_DBUS_ERROR_FAILED,
+            "Failed to create the socket (error %d)", WSAGetLastError());
+        return TRUE;
+    }
+
+    vnc_display_add_client("default", fd, skipauth);
+
+    qemu_vnc1_server_complete_add_client(iface, invocation);
+    return TRUE;
+}
+#else
 static gboolean
 on_add_client(QemuVnc1Server *iface,
               GDBusMethodInvocation *invocation,
@@ -267,6 +307,7 @@ on_add_client(QemuVnc1Server *iface,
     qemu_vnc1_server_complete_add_client(iface, invocation, NULL);
     return TRUE;
 }
+#endif
 
 static void vnc_dbus_add_listeners(VncInfo2 *info)
 {

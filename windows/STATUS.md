@@ -42,7 +42,7 @@ Windows does not have; what replaces it, if anything).
 | --- | --- |
 | image locking (`locking=on|auto`) | **done**: the bytes of file-posix.c, locked with `LockFileEx` past 2^62 (Windows locks are mandatory); `qemu-img info` refuses an image in use, `-U` forces |
 | `aio=native` (linux-aio), `io_uring` | Windows overlapped I/O (`aio=native`) as upstream; IoRing **todo** |
-| FUSE export (`qemu-storage-daemon --export fuse`) | **todo** (WinFsp) |
+| FUSE export (`qemu-storage-daemon --export fuse`) | **done**, on WinFsp's native API (loaded at run time): `mountpoint` is a drive letter or a directory that does not exist (Windows file systems are not mounted over a file), which holds the image as one file named after the export id; `writable`, `growable`, `allow-other`. Test in a VM with WinFsp |
 | vhost-user-blk export | **done** (`qemu-storage-daemon --export type=vhost-user-blk`, with `vhost-user-blk-pci`); VDUSE export **todo** |
 | `host_device`, `host_cdrom` | `\\.\PhysicalDriveN`, `\\.\X:` as upstream |
 
@@ -83,5 +83,6 @@ Windows does not have; what replaces it, if anything).
 | qemu-system-*, qemu-img, qemu-io, qemu-nbd, qemu-storage-daemon, qemu-ga, elf2dmp | built |
 | linux-user (`qemu-ARCH`) | **todo**: a native prototype for aarch64; otherwise through WSL |
 | bsd-user | **no** |
-| qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, qemu-vnc, vhost-user backends of contrib | **todo** / **todo** / **no** / **todo** / **todo** |
+| qemu-vnc | **done**: sockets given to QEMU as WSAPROTOCOL_INFOW (the Win32 D-Bus display API), Win32 map scanouts, AddClient; tested over a session bus |
+| qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, vhost-user backends of contrib | **todo** / **todo** / **no** / vhost-user-bridge done, others **todo** |
 | modules (`--enable-modules`) | **todo** (DLLs) |

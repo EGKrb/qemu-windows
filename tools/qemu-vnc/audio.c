@@ -226,7 +226,7 @@ on_register_audio_listener_finished(GObject *source_object,
 
     qemu_dbus_display1_audio_call_register_out_listener_finish(
         QEMU_DBUS_DISPLAY1_AUDIO(source_object),
-        NULL, res, &err);
+        PEER_NO_FD_LIST res, &err);
 
     if (err) {
         error_report("RegisterOutListener failed: %s", err->message);
@@ -268,12 +268,10 @@ on_register_audio_listener_finished(GObject *source_object,
 
 void audio_setup(GDBusObjectManager *manager)
 {
-    g_autoptr(GError) err = NULL;
-    g_autoptr(GUnixFDList) fd_list = NULL;
     g_autoptr(GDBusInterface) iface = NULL;
+    PeerSocket ps;
     GThread *thread;
     int pair[2];
-    int idx;
 
     iface = g_dbus_object_manager_get_interface(
         manager, DBUS_DISPLAY1_ROOT "/Audio",
@@ -287,12 +285,8 @@ void audio_setup(GDBusObjectManager *manager)
         return;
     }
 
-    fd_list = g_unix_fd_list_new();
-    idx = g_unix_fd_list_append(fd_list, pair[1], &err);
-    close(pair[1]);
-    if (idx < 0) {
+    if (!peer_socket_prepare(G_DBUS_PROXY(iface), pair[1], &ps)) {
         close(pair[0]);
-        error_report("Failed to append fd: %s", err->message);
         return;
     }
 
@@ -300,9 +294,10 @@ void audio_setup(GDBusObjectManager *manager)
 
     qemu_dbus_display1_audio_call_register_out_listener(
         QEMU_DBUS_DISPLAY1_AUDIO(iface),
-        g_variant_new_handle(idx),
+        ps.arg,
         G_DBUS_CALL_FLAGS_NONE, -1,
-        fd_list, NULL,
+        PEER_FD_LIST(ps) NULL,
         on_register_audio_listener_finished,
         thread);
+    peer_socket_clear(&ps);
 }

@@ -84,7 +84,13 @@
         Add a VNC client from an already-connected socket.
     -->
     <method name="AddClient">
+      <?if $(env.HOST_OS) == windows?>
+      <arg type="ay" name="socket" direction="in">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <?else?>
       <arg type="h" name="socket" direction="in"/>
+      <?endif?>
       <arg type="b" name="skipauth" direction="in"/>
     </method>
 

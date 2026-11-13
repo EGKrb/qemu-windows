@@ -5,6 +5,12 @@ if have_vhost_user_blk_server
 endif
 
 blockdev_ss.add(when: fuse, if_true: files('fuse.c'))
+if host_os == 'windows'
+  # WinFsp's headers, its DLL is loaded at run time
+  blockdev_ss.add(files('fuse-win32.c'),
+                  declare_dependency(include_directories:
+                    include_directories('../../windows/winfsp/inc')))
+endif
 
 if have_vduse_blk_export
     blockdev_ss.add(files('vduse-blk.c', 'virtio-blk-handler.c'))

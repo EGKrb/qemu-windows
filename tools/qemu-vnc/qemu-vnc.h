@@ -6,7 +6,9 @@
 
 #include "qemu/osdep.h"
 
+#ifdef G_OS_UNIX
 #include <gio/gunixfdlist.h>
+#endif
 #include "qemu/dbus.h"
 #include "qapi-types-char.h"
 #include "ui/console.h"
@@ -35,6 +37,32 @@ void chardev_setup(const char * const *chardev_names,
                    GDBusObjectManager *manager);
 
 GThread *p2p_dbus_thread_new(int fd);
+
+/*
+ * One end of a socket pair, given to QEMU in a D-Bus call: a descriptor in
+ * a GUnixFDList on POSIX; on Windows the WSAPROTOCOL_INFOW of the socket
+ * duplicated for QEMU's process (the "ay" arguments of the Win32 D-Bus
+ * display interface)
+ */
+typedef struct PeerSocket {
+    GVariant *arg;
+#ifdef G_OS_UNIX
+    GUnixFDList *fd_list;
+#endif
+} PeerSocket;
+
+#ifdef G_OS_UNIX
+#define PEER_FD_LIST(ps) (ps).fd_list,
+/* the out_fd_list argument of the _finish() functions */
+#define PEER_NO_FD_LIST NULL,
+#else
+#define PEER_FD_LIST(ps)
+#define PEER_NO_FD_LIST
+#endif
+
+/* Closes @fd in any case */
+bool peer_socket_prepare(GDBusProxy *proxy, int fd, PeerSocket *ps);
+void peer_socket_clear(PeerSocket *ps);
 
 void vnc_dbus_setup(GDBusConnection *bus);
 void vnc_dbus_emit_leaving(const char *reason);

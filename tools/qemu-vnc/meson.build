@@ -1,8 +1,15 @@
 vnca = vnc_ss.apply({}, strict: false)
 
+vnc1_env = environment()
+vnc1_env.set('HOST_OS', host_os)
+qemu_vnc1_xml = custom_target('qemu-vnc1 preprocess',
+                              input: 'qemu-vnc1.xml',
+                              output: 'qemu-vnc1.xml',
+                              env: vnc1_env,
+                              command: [xml_pp, '@INPUT@', '@OUTPUT@'])
 qemu_vnc1 = custom_target('qemu-vnc1 gdbus-codegen',
                            output: ['qemu-vnc1.h', 'qemu-vnc1.c'],
-                           input: files('qemu-vnc1.xml'),
+                           input: qemu_vnc1_xml,
                            command: [gdbus_codegen, '@INPUT@',
                                      '--glib-min-required', '2.64',
                                      '--output-directory', meson.current_build_dir(),
