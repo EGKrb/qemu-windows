@@ -6,7 +6,7 @@ config TPM_PASSTHROUGH
     bool
     default y
     # FIXME: should check for x86 host as well
-    depends on TPM_BACKEND && LINUX
+    depends on TPM_BACKEND && (LINUX || WIN32)
 
 config TPM_EMULATOR
     bool

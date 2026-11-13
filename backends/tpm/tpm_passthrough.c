@@ -53,7 +53,12 @@ struct TPMPassthruState {
 };
 
 
+#ifdef _WIN32
+/* the TPM of the host, through the TPM Base Services */
+#define TPM_PASSTHROUGH_DEFAULT_DEVICE "tbs"
+#else
 #define TPM_PASSTHROUGH_DEFAULT_DEVICE "/dev/tpm0"
+#endif
 
 /* functions */
 
@@ -87,6 +92,27 @@ static void tpm_passthrough_unix_tx_bufs(TPMPassthruState *tpm_pt,
     *selftest_done = false;
 
     is_selftest = tpm_util_is_selftest(in, in_len);
+
+#ifdef _WIN32
+    ret = tpm_util_tbs_transfer(tpm_pt->tpm_fd, in, in_len, out, out_len);
+    tpm_pt->tpm_executing = false;
+    if (ret < 0) {
+        if (!tpm_pt->tpm_op_canceled || ret != -ECANCELED) {
+            error_setg_errno(errp, -ret, "tpm_passthrough: error while "
+                             "transmitting data to TPM");
+        }
+        goto err_exit;
+    }
+    if (ret < sizeof(struct tpm_resp_hdr) || tpm_cmd_get_size(out) != ret) {
+        ret = -1;
+        error_setg(errp, "tpm_passthrough: received invalid response "
+                   "packet from TPM");
+    }
+    if (is_selftest && (ret >= sizeof(struct tpm_resp_hdr))) {
+        *selftest_done = tpm_cmd_get_errcode(out) == 0;
+    }
+    goto err_exit;
+#endif
 
     ret = qemu_write_full(tpm_pt->tpm_fd, in, in_len);
     if (ret != in_len) {
@@ -167,6 +193,13 @@ static void tpm_passthrough_cancel_cmd(TPMBackend *tb)
      * command, e.g., a command executed on the host.
      */
     if (tpm_pt->tpm_executing) {
+#ifdef _WIN32
+        tpm_pt->tpm_op_canceled = true;
+        if (tpm_util_tbs_cancel(tpm_pt->tpm_fd) < 0) {
+            error_report("Canceling TPM command failed");
+        }
+        return;
+#endif
         if (tpm_pt->cancel_fd >= 0) {
             tpm_pt->tpm_op_canceled = true;
             n = write(tpm_pt->cancel_fd, "-", 1);
@@ -267,6 +300,28 @@ tpm_passthrough_handle_device_opts(TPMPassthruState *tpm_pt, QemuOpts *opts)
     }
 
     tpm_pt->tpm_dev = value ? value : TPM_PASSTHROUGH_DEFAULT_DEVICE;
+#ifdef _WIN32
+    if (strcmp(tpm_pt->tpm_dev, "tbs") != 0) {
+        error_report("Cannot access TPM device using '%s': on Windows, the "
+                     "TPM of the host is 'tbs'", tpm_pt->tpm_dev);
+        return -1;
+    }
+    {
+        Error *err = NULL;
+
+        tpm_pt->tpm_fd = tpm_util_tbs_open(&err);
+        if (tpm_pt->tpm_fd == -1) {
+            error_report_err(err);
+            return -1;
+        }
+    }
+    if (tpm_util_test_tpmdev(tpm_pt->tpm_fd, &tpm_pt->tpm_version)) {
+        error_report("'%s' is not a TPM device.", tpm_pt->tpm_dev);
+        return -1;
+    }
+    /* TBS cancels commands itself: no cancel path */
+    return 0;
+#endif
     tpm_pt->tpm_fd = qemu_open_old(tpm_pt->tpm_dev, O_RDWR);
     if (tpm_pt->tpm_fd < 0) {
         error_report("Cannot access TPM device using '%s': %s",
@@ -355,9 +410,13 @@ static void tpm_passthrough_inst_finalize(Object *obj)
 
     tpm_passthrough_cancel_cmd(TPM_BACKEND(obj));
 
+#ifdef _WIN32
+    tpm_util_tbs_close(tpm_pt->tpm_fd);
+#else
     if (tpm_pt->tpm_fd >= 0) {
         qemu_close(tpm_pt->tpm_fd);
     }
+#endif
     if (tpm_pt->cancel_fd >= 0) {
         qemu_close(tpm_pt->cancel_fd);
     }

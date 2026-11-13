@@ -29,6 +29,7 @@
 #include "hw/core/qdev-properties.h"
 #include "system/tpm_backend.h"
 #include "system/tpm_util.h"
+#include "qemu/sockets.h"
 #include "trace.h"
 #include "qapi/qapi-builtin-type-infos.h"
 
@@ -118,6 +119,97 @@ bool tpm_util_is_selftest(const uint8_t *in, uint32_t in_len)
     return false;
 }
 
+#ifdef _WIN32
+/*
+ * Windows: the TPM of the host is reached through the TPM Base Services
+ * (TBS), with a context instead of /dev/tpm0.  Its "descriptor" for the
+ * functions below is a negative index of a context.
+ */
+#include <tbs.h>
+#ifndef TBS_E_COMMAND_CANCELED
+#define TBS_E_COMMAND_CANCELED ((TBS_RESULT)0x8028400DL)
+#endif
+
+#define TBS_FD_BASE (-100)
+static TBS_HCONTEXT tbs_contexts[8];
+
+int tpm_util_tbs_open(Error **errp)
+{
+    TBS_CONTEXT_PARAMS2 params = {
+        .version = TBS_CONTEXT_VERSION_TWO,
+    };
+    TBS_HCONTEXT ctx;
+    TBS_RESULT r;
+    int i;
+
+    params.includeTpm12 = 1;
+    params.includeTpm20 = 1;
+    r = Tbsi_Context_Create((PCTBS_CONTEXT_PARAMS)&params, &ctx);
+    if (r != TBS_SUCCESS) {
+        error_setg(errp, "cannot open the TPM of the host (TBS error 0x%lx)",
+                   (unsigned long)r);
+        return -1;
+    }
+    for (i = 0; i < ARRAY_SIZE(tbs_contexts); i++) {
+        if (!tbs_contexts[i]) {
+            tbs_contexts[i] = ctx;
+            return TBS_FD_BASE - i;
+        }
+    }
+    Tbsip_Context_Close(ctx);
+    error_setg(errp, "too many TPM contexts");
+    return -1;
+}
+
+static TBS_HCONTEXT tbs_context(int fd)
+{
+    int i = TBS_FD_BASE - fd;
+
+    if (i < 0 || i >= ARRAY_SIZE(tbs_contexts)) {
+        return NULL;
+    }
+    return tbs_contexts[i];
+}
+
+bool tpm_util_is_tbs(int fd)
+{
+    return tbs_context(fd) != NULL;
+}
+
+void tpm_util_tbs_close(int fd)
+{
+    TBS_HCONTEXT ctx = tbs_context(fd);
+
+    if (ctx) {
+        Tbsip_Context_Close(ctx);
+        tbs_contexts[TBS_FD_BASE - fd] = NULL;
+    }
+}
+
+ssize_t tpm_util_tbs_transfer(int fd, const void *in, size_t in_len,
+                              void *out, size_t out_len)
+{
+    UINT32 len = out_len;
+    TBS_RESULT r;
+
+    r = Tbsip_Submit_Command(tbs_context(fd), TBS_COMMAND_LOCALITY_ZERO,
+                             TBS_COMMAND_PRIORITY_NORMAL, in, in_len, out,
+                             &len);
+    if (r == TBS_E_COMMAND_CANCELED) {
+        return -ECANCELED;
+    }
+    if (r != TBS_SUCCESS) {
+        return -EIO;
+    }
+    return len;
+}
+
+int tpm_util_tbs_cancel(int fd)
+{
+    return Tbsip_Cancel_Commands(tbs_context(fd)) == TBS_SUCCESS ? 0 : -EIO;
+}
+#endif
+
 /*
  * Send request to a TPM device. We expect a response within one second.
  */
@@ -129,6 +221,45 @@ static int tpm_util_request(int fd,
 {
     GPollFD fds[1] = { {.fd = fd, .events = G_IO_IN } };
     int n;
+
+#ifdef _WIN32
+    if (tpm_util_is_tbs(fd)) {
+        n = tpm_util_tbs_transfer(fd, request, requestlen, response,
+                                  responselen);
+        if (n < 0) {
+            return n;
+        }
+        if (n < sizeof(struct tpm_resp_hdr) ||
+            tpm_cmd_get_size(response) != n) {
+            return -EMSGSIZE;
+        }
+        return 0;
+    }
+#endif
+
+#ifdef _WIN32
+    /* the data socket of tpm-emulator: Winsock, not write() and g_poll() */
+    if (fd_is_socket(fd)) {
+        WSAPOLLFD p = { .fd = (SOCKET)_get_osfhandle(fd), .events = POLLRDNORM };
+
+        (void)fds;
+        n = send(fd, request, requestlen, 0);
+        if (n != requestlen) {
+            return n < 0 ? -errno : -EFAULT;
+        }
+        if (WSAPoll(&p, 1, 1000) != 1) {
+            return -ETIMEDOUT;
+        }
+        n = recv(fd, response, responselen, 0);
+        if (n < sizeof(struct tpm_resp_hdr)) {
+            return -EFAULT;
+        }
+        if (tpm_cmd_get_size(response) != n) {
+            return -EMSGSIZE;
+        }
+        return 0;
+    }
+#endif
 
     n = write(fd, request, requestlen);
     if (n < 0) {

@@ -679,6 +679,9 @@ static int tpm_emulator_handle_device_opts(TPMEmulator *tpm_emu, QemuOpts *opts)
 
     tpm_emu->options->chardev = g_strdup(value);
 
+    /* Windows: swtpm gets the data socket as a handle in a frame */
+    qemu_chr_fe_set_handle_passing(&tpm_emu->ctrl_chr);
+
     if (tpm_emulator_prepare_data_fd(tpm_emu) < 0) {
         goto err;
     }

@@ -32,6 +32,16 @@ bool tpm_util_is_selftest(const uint8_t *in, uint32_t in_len);
 
 int tpm_util_test_tpmdev(int tpm_fd, TPMVersion *tpm_version);
 
+#ifdef _WIN32
+/* the TPM of the host through TBS: a negative "descriptor" */
+int tpm_util_tbs_open(Error **errp);
+bool tpm_util_is_tbs(int fd);
+void tpm_util_tbs_close(int fd);
+ssize_t tpm_util_tbs_transfer(int fd, const void *in, size_t in_len,
+                              void *out, size_t out_len);
+int tpm_util_tbs_cancel(int fd);
+#endif
+
 static inline uint16_t tpm_cmd_get_tag(const void *b)
 {
     return lduw_be_p(b);
