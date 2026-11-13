@@ -41,6 +41,14 @@
 
 #ifdef _WIN32
 
+typedef struct {
+    WinChardev parent;
+    /* the modem lines QEMU drives: Windows cannot read them back */
+    int tiocm_out;
+} SerialWinChardev;
+
+#define SERIAL_WIN_CHARDEV(obj)     OBJECT_CHECK(SerialWinChardev, (obj), TYPE_CHARDEV_SERIAL)
+
 static bool serial_chr_open(Chardev *chr, ChardevBackend *backend, Error **errp)
 {
     ChardevHostdev *serial = backend->u.serial.data;
@@ -49,9 +57,92 @@ static bool serial_chr_open(Chardev *chr, ChardevBackend *backend, Error **errp)
         return false;
     }
 
+    /* win_chr_serial_init() leaves DTR and RTS on */
+    SERIAL_WIN_CHARDEV(chr)->tiocm_out = CHR_TIOCM_DTR | CHR_TIOCM_RTS;
     qemu_chr_be_event(chr, CHR_EVENT_OPENED);
 
     return true;
+}
+
+/* The settings of the guest's UART go to the host's port, as on POSIX */
+static int serial_chr_ioctl(Chardev *chr, int cmd, void *arg)
+{
+    SerialWinChardev *s = SERIAL_WIN_CHARDEV(chr);
+    HANDLE h = s->parent.file;
+
+    switch (cmd) {
+    case CHR_IOCTL_SERIAL_SET_PARAMS:
+        {
+            QEMUSerialSetParams *ssp = arg;
+            DCB dcb = { .DCBlength = sizeof(dcb) };
+
+            if (!GetCommState(h, &dcb)) {
+                return -EIO;
+            }
+            dcb.BaudRate = ssp->speed;
+            dcb.ByteSize = ssp->data_bits;
+            switch (ssp->parity) {
+            case 'E':
+                dcb.Parity = EVENPARITY;
+                break;
+            case 'O':
+                dcb.Parity = ODDPARITY;
+                break;
+            default:
+                dcb.Parity = NOPARITY;
+                break;
+            }
+            dcb.fParity = dcb.Parity != NOPARITY;
+            dcb.StopBits = ssp->stop_bits == 2 ? TWOSTOPBITS : ONESTOPBIT;
+            if (!SetCommState(h, &dcb)) {
+                return -EIO;
+            }
+        }
+        break;
+    case CHR_IOCTL_SERIAL_SET_BREAK:
+        {
+            int enable = *(int *)arg;
+            if (enable) {
+                SetCommBreak(h);
+            } else {
+                ClearCommBreak(h);
+            }
+        }
+        break;
+    case CHR_IOCTL_SERIAL_GET_TIOCM:
+        {
+            DWORD status = 0;
+            int *targ = (int *)arg;
+
+            GetCommModemStatus(h, &status);
+            *targ = s->tiocm_out;
+            if (status & MS_CTS_ON) {
+                *targ |= CHR_TIOCM_CTS;
+            }
+            if (status & MS_RLSD_ON) {
+                *targ |= CHR_TIOCM_CAR;
+            }
+            if (status & MS_DSR_ON) {
+                *targ |= CHR_TIOCM_DSR;
+            }
+            if (status & MS_RING_ON) {
+                *targ |= CHR_TIOCM_RI;
+            }
+        }
+        break;
+    case CHR_IOCTL_SERIAL_SET_TIOCM:
+        {
+            int sarg = *(int *)arg;
+
+            EscapeCommFunction(h, sarg & CHR_TIOCM_DTR ? SETDTR : CLRDTR);
+            EscapeCommFunction(h, sarg & CHR_TIOCM_RTS ? SETRTS : CLRRTS);
+            s->tiocm_out = sarg & (CHR_TIOCM_DTR | CHR_TIOCM_RTS);
+        }
+        break;
+    default:
+        return -ENOTSUP;
+    }
+    return 0;
 }
 
 #elif defined(__linux__) || defined(__sun__) || defined(__FreeBSD__)      \
@@ -310,9 +401,7 @@ static void char_serial_class_init(ObjectClass *oc, const void *data)
 
     cc->chr_parse = serial_chr_parse;
     cc->chr_open = serial_chr_open;
-#ifndef _WIN32
     cc->chr_ioctl = serial_chr_ioctl;
-#endif
 }
 
 
@@ -320,6 +409,7 @@ static const TypeInfo char_serial_type_info = {
     .name = TYPE_CHARDEV_SERIAL,
 #ifdef _WIN32
     .parent = TYPE_CHARDEV_WIN,
+    .instance_size = sizeof(SerialWinChardev),
 #else
     .parent = TYPE_CHARDEV_FD,
 #endif

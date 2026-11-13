@@ -13,12 +13,10 @@ if have_hmp
   system_ss.add(files('cryptodev-hmp-cmds.c'))
 endif
 
-if host_os != 'windows'
-  system_ss.add(files('rng-random.c'))
-  if host_os != 'emscripten'
-    system_ss.add(files('hostmem-file.c'))
-    system_ss.add([files('hostmem-shm.c'), rt])
-  endif
+system_ss.add(files('rng-random.c'))
+if host_os != 'emscripten'
+  system_ss.add(files('hostmem-file.c'))
+  system_ss.add([files('hostmem-shm.c'), rt])
 endif
 if host_os == 'linux'
   system_ss.add(files('hostmem-memfd.c'))

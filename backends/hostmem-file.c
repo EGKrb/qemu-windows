@@ -39,11 +39,6 @@ struct HostMemoryBackendFile {
 static bool
 file_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
 {
-#ifndef CONFIG_POSIX
-    error_setg(errp, "backend '%s' not supported on this host",
-               object_get_typename(OBJECT(backend)));
-    return false;
-#else
     HostMemoryBackendFile *fb = MEMORY_BACKEND_FILE(backend);
     g_autofree gchar *name = NULL;
     uint32_t ram_flags;
@@ -92,7 +87,6 @@ file_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
     return memory_region_init_ram_from_file(&backend->mr, OBJECT(backend), name,
                                             backend->size, fb->align, ram_flags,
                                             fb->mem_path, fb->offset, errp);
-#endif
 }
 
 static char *get_mem_path(Object *o, Error **errp)

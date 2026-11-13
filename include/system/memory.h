@@ -1166,7 +1166,7 @@ bool memory_region_init_resizeable_ram(MemoryRegion *mr,
                                                        uint64_t length,
                                                        void *host),
                                        Error **errp);
-#ifdef CONFIG_POSIX
+#if defined(CONFIG_POSIX) || defined(_WIN32)
 
 /**
  * memory_region_init_ram_from_file:  Initialize RAM memory region with a

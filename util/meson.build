@@ -23,6 +23,7 @@ else
   util_ss.add(files('aio-win32.c'))
   util_ss.add(files('event_notifier-win32.c'))
   util_ss.add(files('oslib-win32.c'))
+  util_ss.add(files('mmap-alloc-win32.c'))
   util_ss.add(files('qemu-thread-win32.c'))
   util_ss.add(winmm, pathcch, synchronization)
 endif

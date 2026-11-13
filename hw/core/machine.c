@@ -422,7 +422,7 @@ static void machine_set_mem_merge(Object *obj, bool value, Error **errp)
     ms->mem_merge = value;
 }
 
-#ifdef CONFIG_POSIX
+#if defined(CONFIG_POSIX) || defined(_WIN32)
 static bool machine_get_aux_ram_share(Object *obj, Error **errp)
 {
     MachineState *ms = MACHINE(obj);
@@ -1171,7 +1171,7 @@ static void machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "mem-merge",
         "Enable/disable memory merge support");
 
-#ifdef CONFIG_POSIX
+#if defined(CONFIG_POSIX) || defined(_WIN32)
     object_class_property_add_bool(oc, "aux-ram-share",
                                    machine_get_aux_ram_share,
                                    machine_set_aux_ram_share);

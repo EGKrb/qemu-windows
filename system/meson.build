@@ -40,6 +40,9 @@ if have_tpm
 endif
 
 system_ss.add(when: seccomp, if_true: files('qemu-seccomp.c'))
+if host_os == 'windows'
+  system_ss.add(files('qemu-sandbox-win32.c'))
+endif
 system_ss.add(when: 'CONFIG_DEVICE_TREE',
               if_true: [fdt, files('device_tree.c')])
 stub_ss.add(files('device_tree-stub.c'))

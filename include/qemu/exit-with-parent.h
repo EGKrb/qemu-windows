@@ -38,7 +38,8 @@
 /* Test if the feature is available on the platform. */
 static inline bool can_exit_with_parent(void)
 {
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__APPLE__) || \
+    defined(_WIN32)
     return true;
 #else
     return false;

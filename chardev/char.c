@@ -465,6 +465,13 @@ QemuOpts *qemu_chr_parse_compat(const char *label, const char *filename,
         qemu_opt_set(opts, "path", filename, &error_abort);
         return opts;
     }
+#ifdef _WIN32
+    if (strstart(filename, "LPT", NULL)) {
+        qemu_opt_set(opts, "backend", "parallel", &error_abort);
+        qemu_opt_set(opts, "path", filename, &error_abort);
+        return opts;
+    }
+#endif
     if (strstart(filename, "file:", &p)) {
         qemu_opt_set(opts, "backend", "file", &error_abort);
         qemu_opt_set(opts, "path", p, &error_abort);

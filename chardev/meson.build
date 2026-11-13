@@ -16,6 +16,8 @@ chardev_ss.add(files(
 if host_os == 'windows'
   chardev_ss.add(files(
     'char-console.c',
+    'char-parallel-win.c',
+    'char-pty-win.c',
     'char-win-stdio.c',
     'char-win.c',
   ))

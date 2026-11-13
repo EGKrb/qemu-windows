@@ -8,6 +8,10 @@ typedef enum {
     QEMU_FS_TYPE_NUM,
 } QemuFsType;
 
+#ifndef MAP_FAILED
+#define MAP_FAILED ((void *) -1)
+#endif
+
 size_t qemu_fd_getpagesize(int fd);
 QemuFsType qemu_fd_getfs(int fd);
 

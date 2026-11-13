@@ -894,10 +894,50 @@ void qemu_win32_map_free(void *ptr, HANDLE h, Error **errp)
     CloseHandle(h);
 }
 
+/*
+ * Anonymous shared memory: a temporary file that only lives while open
+ * (FILE_FLAG_DELETE_ON_CLOSE), kept in the cache as far as possible
+ * (FILE_ATTRIBUTE_TEMPORARY), shared by mapping its handle, as the
+ * unlinked POSIX shared memory object is.
+ */
 int qemu_shm_alloc(size_t size, Error **errp)
 {
-    error_setg(errp, "Shared memory is not supported.");
-    return -1;
+    static int sequence;
+    wchar_t dir[MAX_PATH + 1], name[MAX_PATH + 64];
+    HANDLE h;
+    int fd;
+
+    if (!GetTempPathW(MAX_PATH + 1, dir)) {
+        error_setg_win32(errp, GetLastError(), "failed to find the temporary "
+                         "directory for shared memory");
+        return -1;
+    }
+    swprintf(name, MAX_PATH + 64, L"%lsqemu-%lu-shm-%d-%08x", dir,
+             GetCurrentProcessId(), qatomic_fetch_inc(&sequence),
+             g_random_int());
+    h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, CREATE_NEW,
+                    FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                    NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        error_setg_win32(errp, GetLastError(),
+                         "failed to create shared memory");
+        return -1;
+    }
+    fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(h);
+        error_setg(errp, "failed to create shared memory");
+        return -1;
+    }
+    if (qemu_ftruncate64(fd, size) == -1) {
+        error_setg_errno(errp, errno,
+                         "failed to resize shared memory to %zu", size);
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 int qemu_ftruncate64(int fd, int64_t length)

@@ -40,7 +40,7 @@ DEF("machine", HAS_ARG, QEMU_OPTION_machine, \
     "                memory-encryption=<id> (memory-encryption is the alias of confidential-guest-support, recommend to use confidential-guest-support)\n"
     "                hmat=on|off controls ACPI HMAT support (default=off)\n"
     "                spcr=on|off controls ACPI SPCR support (default=on)\n"
-#ifdef CONFIG_POSIX
+#if defined(CONFIG_POSIX) || defined(_WIN32)
     "                aux-ram-share=on|off allocate auxiliary guest RAM as shared (default: off)\n"
 #endif
     "                memory-backend='backend-id' specifies explicitly provided backend for main RAM (default=none)\n"
@@ -5303,7 +5303,7 @@ SRST
     Start right away with a saved state (``loadvm`` in monitor)
 ERST
 
-#if !defined(_WIN32) && !defined(EMSCRIPTEN)
+#if !defined(EMSCRIPTEN)
 DEF("daemonize", 0, QEMU_OPTION_daemonize, \
     "-daemonize      daemonize QEMU after initializing\n", QEMU_ARCH_ALL)
 #endif
@@ -5683,7 +5683,7 @@ HXCOMM Internal use
 DEF("qtest", HAS_ARG, QEMU_OPTION_qtest, "", QEMU_ARCH_ALL)
 DEF("qtest-log", HAS_ARG, QEMU_OPTION_qtest_log, "", QEMU_ARCH_ALL)
 
-#if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)
+#if (defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)) || defined(_WIN32)
 DEF("run-with", HAS_ARG, QEMU_OPTION_run_with,
     "-run-with [async-teardown=on|off][,chroot=dir]\n" \
     "          [,exit-with-parent=on|off][,user=username|uid:gid]\n"

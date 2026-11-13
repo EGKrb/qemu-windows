@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "block/block-io.h"
 #include "block/block_int.h"
 #include "qemu/module.h"
@@ -57,6 +58,13 @@ typedef struct BDRVRawState {
     int type;
     char drive_path[16]; /* format: "d:\" */
     QEMUWin32AIOState *aio;
+
+    /* image locking, as file-posix.c does it */
+    bool use_lock;
+    uint64_t perm;
+    uint64_t shared_perm;
+    uint64_t locked_perm;
+    uint64_t locked_shared_perm;
 } BDRVRawState;
 
 typedef struct BDRVRawReopenState {
@@ -299,6 +307,280 @@ static bool get_aio_option(QemuOpts *opts, int flags, Error **errp)
     return false;
 }
 
+/*
+ * Image locking
+ *
+ * The bytes and their meaning are those of file-posix.c: a shared lock
+ * on RAW_LOCK_PERM_BASE + i while permission i is held, on
+ * RAW_LOCK_SHARED_BASE + i while it is not shared with others.  The
+ * locks of LockFileEx() are mandatory, they would forbid I/O to the
+ * header of the image: the bytes are moved past 2^62, where no data is
+ * (libvirt-windows moves its own locks the same way).  An exclusive
+ * LockFileEx() stands for the F_OFD_GETLK test; Windows does not
+ * upgrade a lock of the same handle, so the test releases ours first.
+ */
+#define RAW_LOCK_SHADOW_OFFSET  (1ULL << 62)
+#define RAW_LOCK_PERM_BASE      100
+#define RAW_LOCK_SHARED_BASE    200
+
+#define PERM_FOREACH(i) \
+    for ((i) = 0; (1ULL << (i)) <= BLK_PERM_ALL; i++)
+
+typedef enum {
+    RAW_PL_PREPARE,
+    RAW_PL_COMMIT,
+    RAW_PL_ABORT,
+} RawPermLockOp;
+
+static int raw_lock_byte(HANDLE h, int off, bool exclusive)
+{
+    uint64_t offset = RAW_LOCK_SHADOW_OFFSET + off;
+    OVERLAPPED ov = {
+        .Offset = (DWORD)offset,
+        .OffsetHigh = (DWORD)(offset >> 32),
+    };
+    DWORD flags = LOCKFILE_FAIL_IMMEDIATELY;
+    DWORD size;
+    int ret = 0;
+
+    if (exclusive) {
+        flags |= LOCKFILE_EXCLUSIVE_LOCK;
+    }
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!LockFileEx(h, flags, 0, 1, 0, &ov)) {
+        DWORD err = GetLastError();
+
+        if (err == ERROR_IO_PENDING) {
+            /* overlapped handles: the result comes at once anyway */
+            if (!GetOverlappedResult(h, &ov, &size, TRUE)) {
+                err = GetLastError();
+            } else {
+                err = 0;
+            }
+        }
+        if (err == ERROR_LOCK_VIOLATION) {
+            ret = -EAGAIN;
+        } else if (err) {
+            ret = -EIO;
+        }
+    }
+    CloseHandle(ov.hEvent);
+    return ret;
+}
+
+static int raw_unlock_byte(HANDLE h, int off)
+{
+    uint64_t offset = RAW_LOCK_SHADOW_OFFSET + off;
+    OVERLAPPED ov = {
+        .Offset = (DWORD)offset,
+        .OffsetHigh = (DWORD)(offset >> 32),
+    };
+
+    return UnlockFileEx(h, 0, 1, 0, &ov) ? 0 : -EIO;
+}
+
+/* Does another handle hold a lock on the byte?  @held: we hold one */
+static int raw_test_byte(HANDLE h, int off, bool held)
+{
+    int ret;
+
+    if (held) {
+        raw_unlock_byte(h, off);
+    }
+    ret = raw_lock_byte(h, off, true);
+    if (!ret) {
+        raw_unlock_byte(h, off);
+    }
+    if (held) {
+        raw_lock_byte(h, off, false);
+    }
+    return ret;
+}
+
+#define raw_lock_error_setg_errno(errp, err, fmt, ...)                  \
+    do {                                                                \
+        if ((err) == EAGAIN || (err) == EACCES) {                       \
+            error_setg((errp), (fmt), ## __VA_ARGS__);                  \
+        } else {                                                        \
+            error_setg_errno((errp), (err), (fmt), ## __VA_ARGS__);     \
+        }                                                               \
+    } while (0)
+
+/*
+ * Lock bytes indicated by @perm_lock_bits and @shared_perm_lock_bits in the
+ * file; if @unlock == true, also unlock the unneeded bytes.
+ * @shared_perm_lock_bits is the mask of all permissions that are NOT shared.
+ */
+static int raw_apply_lock_bytes(BDRVRawState *s, HANDLE h,
+                                uint64_t perm_lock_bits,
+                                uint64_t shared_perm_lock_bits,
+                                bool unlock, Error **errp)
+{
+    int ret;
+    int i;
+
+    PERM_FOREACH(i) {
+        int off = RAW_LOCK_PERM_BASE + i;
+        uint64_t bit = (1ULL << i);
+        if ((perm_lock_bits & bit) && !(s->locked_perm & bit)) {
+            ret = raw_lock_byte(h, off, false);
+            if (ret) {
+                raw_lock_error_setg_errno(errp, -ret, "Failed to lock byte %d",
+                                          off);
+                return ret;
+            }
+            s->locked_perm |= bit;
+        } else if (unlock && (s->locked_perm & bit) &&
+                   !(perm_lock_bits & bit)) {
+            ret = raw_unlock_byte(h, off);
+            if (ret) {
+                error_setg_errno(errp, -ret, "Failed to unlock byte %d", off);
+                return ret;
+            }
+            s->locked_perm &= ~bit;
+        }
+    }
+    PERM_FOREACH(i) {
+        int off = RAW_LOCK_SHARED_BASE + i;
+        uint64_t bit = (1ULL << i);
+        if ((shared_perm_lock_bits & bit) && !(s->locked_shared_perm & bit)) {
+            ret = raw_lock_byte(h, off, false);
+            if (ret) {
+                raw_lock_error_setg_errno(errp, -ret, "Failed to lock byte %d",
+                                          off);
+                return ret;
+            }
+            s->locked_shared_perm |= bit;
+        } else if (unlock && (s->locked_shared_perm & bit) &&
+                   !(shared_perm_lock_bits & bit)) {
+            ret = raw_unlock_byte(h, off);
+            if (ret) {
+                error_setg_errno(errp, -ret, "Failed to unlock byte %d", off);
+                return ret;
+            }
+            s->locked_shared_perm &= ~bit;
+        }
+    }
+    return 0;
+}
+
+/* Check "unshared" bytes implied by @perm and ~@shared_perm in the file. */
+static int raw_check_lock_bytes(BDRVRawState *s, HANDLE h, uint64_t perm,
+                                uint64_t shared_perm, Error **errp)
+{
+    int ret;
+    int i;
+
+    PERM_FOREACH(i) {
+        int off = RAW_LOCK_SHARED_BASE + i;
+        uint64_t p = 1ULL << i;
+        if (perm & p) {
+            ret = raw_test_byte(h, off, s->locked_shared_perm & p);
+            if (ret) {
+                char *perm_name = bdrv_perm_names(p);
+
+                raw_lock_error_setg_errno(errp, -ret,
+                                          "Failed to get \"%s\" lock",
+                                          perm_name);
+                g_free(perm_name);
+                return ret;
+            }
+        }
+    }
+    PERM_FOREACH(i) {
+        int off = RAW_LOCK_PERM_BASE + i;
+        uint64_t p = 1ULL << i;
+        if (!(shared_perm & p)) {
+            ret = raw_test_byte(h, off, s->locked_perm & p);
+            if (ret) {
+                char *perm_name = bdrv_perm_names(p);
+
+                raw_lock_error_setg_errno(errp, -ret,
+                                          "Failed to get shared \"%s\" lock",
+                                          perm_name);
+                g_free(perm_name);
+                return ret;
+            }
+        }
+    }
+    return 0;
+}
+
+static int raw_handle_perm_lock(BlockDriverState *bs,
+                                RawPermLockOp op,
+                                uint64_t new_perm, uint64_t new_shared,
+                                Error **errp)
+{
+    BDRVRawState *s = bs->opaque;
+    int ret = 0;
+    Error *local_err = NULL;
+
+    if (!s->use_lock) {
+        return 0;
+    }
+
+    if (bdrv_get_flags(bs) & BDRV_O_INACTIVE) {
+        return 0;
+    }
+
+    switch (op) {
+    case RAW_PL_PREPARE:
+        if ((s->perm | new_perm) == s->perm &&
+            (s->shared_perm & new_shared) == s->shared_perm) {
+            return 0;
+        }
+        ret = raw_apply_lock_bytes(s, s->hfile, s->perm | new_perm,
+                                   ~s->shared_perm | ~new_shared,
+                                   false, errp);
+        if (!ret) {
+            ret = raw_check_lock_bytes(s, s->hfile, new_perm, new_shared,
+                                       errp);
+            if (!ret) {
+                return 0;
+            }
+            error_append_hint(errp,
+                              "Is another process using the image [%s]?\n",
+                              bs->filename);
+        }
+        /* fall through to unlock bytes. */
+    case RAW_PL_ABORT:
+        raw_apply_lock_bytes(s, s->hfile, s->perm, ~s->shared_perm,
+                             true, &local_err);
+        if (local_err) {
+            warn_report_err(local_err);
+        }
+        break;
+    case RAW_PL_COMMIT:
+        raw_apply_lock_bytes(s, s->hfile, new_perm, ~new_shared,
+                             true, &local_err);
+        if (local_err) {
+            warn_report_err(local_err);
+        }
+        break;
+    }
+    return ret;
+}
+
+static int raw_check_perm(BlockDriverState *bs, uint64_t perm,
+                          uint64_t shared, Error **errp)
+{
+    return raw_handle_perm_lock(bs, RAW_PL_PREPARE, perm, shared, errp);
+}
+
+static void raw_set_perm(BlockDriverState *bs, uint64_t perm, uint64_t shared)
+{
+    BDRVRawState *s = bs->opaque;
+
+    raw_handle_perm_lock(bs, RAW_PL_COMMIT, perm, shared, NULL);
+    s->perm = perm;
+    s->shared_perm = shared;
+}
+
+static void raw_abort_perm_update(BlockDriverState *bs)
+{
+    raw_handle_perm_lock(bs, RAW_PL_ABORT, 0, 0, NULL);
+}
+
 static int raw_open(BlockDriverState *bs, QDict *options, int flags,
                     Error **errp)
 {
@@ -330,11 +612,11 @@ static int raw_open(BlockDriverState *bs, QDict *options, int flags,
     }
     switch (locking) {
     case ON_OFF_AUTO_ON:
-        error_setg(errp, "locking=on is not supported on Windows");
-        ret = -EINVAL;
-        goto fail;
-    case ON_OFF_AUTO_OFF:
     case ON_OFF_AUTO_AUTO:
+        s->use_lock = true;
+        break;
+    case ON_OFF_AUTO_OFF:
+        s->use_lock = false;
         break;
     default:
         g_assert_not_reached();
@@ -675,6 +957,19 @@ static void raw_reopen_commit(BDRVReopenState *state)
     CloseHandle(s->hfile);
     s->hfile = rs->hfile;
 
+    /* the locks went with the old handle: take them on the new one */
+    if (s->use_lock && (s->locked_perm || s->locked_shared_perm)) {
+        uint64_t perm = s->locked_perm, unshared = s->locked_shared_perm;
+        Error *local_err = NULL;
+
+        s->locked_perm = 0;
+        s->locked_shared_perm = 0;
+        if (raw_apply_lock_bytes(s, s->hfile, perm, unshared, false,
+                                 &local_err) < 0) {
+            warn_report_err(local_err);
+        }
+    }
+
     g_free(rs);
     state->opaque = NULL;
 }
@@ -723,6 +1018,10 @@ BlockDriver bdrv_file = {
     .bdrv_reopen_prepare = raw_reopen_prepare,
     .bdrv_reopen_commit  = raw_reopen_commit,
     .bdrv_reopen_abort   = raw_reopen_abort,
+
+    .bdrv_check_perm = raw_check_perm,
+    .bdrv_set_perm   = raw_set_perm,
+    .bdrv_abort_perm_update = raw_abort_perm_update,
 
     .bdrv_aio_preadv    = raw_aio_preadv,
     .bdrv_aio_pwritev   = raw_aio_pwritev,

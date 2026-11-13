@@ -130,6 +130,82 @@ set_exit_with_parent(void)
     return 0;
 }
 
+#elif defined(_WIN32)
+
+/*
+ * For Windows: a thread waits on the handle of the parent process, found
+ * by its id in a snapshot of the processes.  The parent must have started
+ * before us, or its id was reused by another process: the parent is then
+ * already gone.
+ */
+
+#include <tlhelp32.h>
+#include "qemu/thread.h"
+#include "qemu/error-report.h"
+#include "system/runstate.h"
+
+static HANDLE parent_process;
+static DWORD parent_pid;
+
+static void *
+exit_with_parent_loop(void *vp)
+{
+    WaitForSingleObject(parent_process, INFINITE);
+    /* Behave like Linux and FreeBSD above, as if SIGTERM was sent */
+    qemu_system_killed(SIGTERM, parent_pid);
+    return NULL;
+}
+
+static uint64_t
+process_start_time(HANDLE process)
+{
+    FILETIME created, exited, kernel, user;
+
+    if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+        return 0;
+    }
+    return ((uint64_t)created.dwHighDateTime << 32) | created.dwLowDateTime;
+}
+
+int
+set_exit_with_parent(void)
+{
+    QemuThread exit_with_parent_thread;
+    PROCESSENTRY32W pe = { .dwSize = sizeof(pe) };
+    DWORD self = GetCurrentProcessId();
+    HANDLE snapshot;
+
+    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+    if (Process32FirstW(snapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID == self) {
+                parent_pid = pe.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &pe));
+    }
+    CloseHandle(snapshot);
+
+    parent_process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                                 FALSE, parent_pid);
+    if (!parent_process ||
+        process_start_time(parent_process) >
+        process_start_time(GetCurrentProcess())) {
+        /* the parent has exited already */
+        qemu_system_killed(SIGTERM, parent_pid);
+        return 0;
+    }
+
+    qemu_thread_create(&exit_with_parent_thread,
+                       "exit-parent",
+                       exit_with_parent_loop, NULL,
+                       QEMU_THREAD_DETACHED);
+    return 0;
+}
+
 #else /* any platform that doesn't support this function */
 
 int

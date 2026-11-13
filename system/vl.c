@@ -773,7 +773,7 @@ static QemuOptsList qemu_smp_opts = {
     },
 };
 
-#if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)
+#if (defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)) || defined(_WIN32)
 static QemuOptsList qemu_run_with_opts = {
     .name = "run-with",
     .head = QTAILQ_HEAD_INITIALIZER(qemu_run_with_opts.head),
@@ -2612,7 +2612,7 @@ static void qemu_process_early_options(void)
 
     object_option_foreach_add(object_create_pre_sandbox);
 
-#ifdef CONFIG_SECCOMP
+#if defined(CONFIG_SECCOMP) || defined(_WIN32)
     QemuOptsList *olist = qemu_find_opts_err("sandbox", NULL);
     if (olist) {
         qemu_opts_foreach(olist, parse_sandbox, NULL, &error_fatal);
@@ -3713,7 +3713,7 @@ void qemu_init(int argc, char **argv)
             case QEMU_OPTION_nouserconfig:
                 /* Nothing to be parsed here. Especially, do not error out below. */
                 break;
-#if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)
+#if (defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)) || defined(_WIN32)
             case QEMU_OPTION_daemonize:
                 os_set_daemonize(true);
                 break;
@@ -3731,7 +3731,12 @@ void qemu_init(int argc, char **argv)
 #endif
                 str = qemu_opt_get(opts, "chroot");
                 if (str) {
+#ifdef _WIN32
+                    error_report("chroot is not available on Windows");
+                    exit(1);
+#else
                     os_set_chroot(str);
+#endif
                 }
                 if (qemu_opt_get_bool(opts, "exit-with-parent", false)) {
                     if (!can_exit_with_parent()) {
@@ -3743,12 +3748,17 @@ void qemu_init(int argc, char **argv)
                 }
                 str = qemu_opt_get(opts, "user");
                 if (str) {
+#ifdef _WIN32
+                    error_report("user is not available on Windows");
+                    exit(1);
+#else
                     if (!os_set_runas(str)) {
                         error_report("User \"%s\" doesn't exist"
                                      " (and is not <uid>:<gid>)",
                                      optarg);
                         exit(1);
                     }
+#endif
                 }
 
                 break;

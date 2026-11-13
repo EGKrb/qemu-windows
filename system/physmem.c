@@ -80,9 +80,7 @@
 #include "migration/vmstate.h"
 
 #include "qemu/range.h"
-#ifndef _WIN32
 #include "qemu/mmap-alloc.h"
-#endif
 
 #ifdef CONFIG_LIBDAXCTL
 #include <daxctl/libdaxctl.h>
@@ -1537,10 +1535,14 @@ long qemu_maxrampagesize(void)
     return pagesize;
 }
 
-#if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)
+#if (defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)) || defined(_WIN32)
 static int64_t get_file_size(int fd)
 {
     int64_t size;
+#if defined(_WIN32)
+    size = _filelengthi64(fd);
+    return size < 0 ? -errno : size;
+#endif
 #if defined(__linux__)
     struct stat st;
 
@@ -1622,6 +1624,65 @@ static int64_t get_file_align(int fd)
     return align;
 }
 
+#ifdef _WIN32
+/*
+ * Windows: open (or create) @path; if it is a directory, create a file
+ * there that disappears when closed, as the unlinked mkstemp() file does.
+ */
+static int file_ram_open(const char *path,
+                         const char *region_name,
+                         bool readonly,
+                         bool *created)
+{
+    int fd;
+
+    *created = false;
+    if (g_file_test(path, G_FILE_TEST_IS_DIR)) {
+        g_autofree char *sanitized = g_strdup(region_name);
+        g_autofree char *filename = NULL;
+        g_autofree gunichar2 *wfilename = NULL;
+        HANDLE h;
+
+        if (readonly) {
+            return -EISDIR;
+        }
+        g_strdelimit(sanitized, "/\\:*?\"<>|", '_');
+        filename = g_strdup_printf("%s\\qemu_back_mem.%s.%08x%08x", path,
+                                   sanitized, g_random_int(), g_random_int());
+        wfilename = g_utf8_to_utf16(filename, -1, NULL, NULL, NULL);
+        if (!wfilename) {
+            return -EINVAL;
+        }
+        h = CreateFileW(wfilename, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, CREATE_NEW,
+                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                        NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            return GetLastError() == ERROR_ACCESS_DENIED ? -EACCES : -EIO;
+        }
+        fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+        if (fd < 0) {
+            CloseHandle(h);
+            return -EBADF;
+        }
+        return fd;
+    }
+
+    fd = open(path, (readonly ? O_RDONLY : O_RDWR) | O_BINARY);
+    if (fd >= 0) {
+        return fd;
+    }
+    if (errno == ENOENT && !readonly) {
+        fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_BINARY, 0644);
+        if (fd >= 0) {
+            *created = true;
+            return fd;
+        }
+    }
+    return -errno;
+}
+#else
 static int file_ram_open(const char *path,
                          const char *region_name,
                          bool readonly,
@@ -1702,6 +1763,7 @@ static int file_ram_open(const char *path,
 
     return fd;
 }
+#endif
 
 static void *file_ram_alloc(RAMBlock *block,
                             ram_addr_t memory,
@@ -2303,7 +2365,7 @@ out_free:
     }
 }
 
-#if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)
+#if (defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)) || defined(_WIN32)
 RAMBlock *qemu_ram_alloc_from_fd(ram_addr_t size, ram_addr_t max_size,
                                  qemu_ram_resize_cb resized, MemoryRegion *mr,
                                  uint32_t ram_flags, int fd, off_t offset,
@@ -2424,10 +2486,10 @@ RAMBlock *qemu_ram_alloc_from_file(ram_addr_t size, MemoryRegion *mr,
     block = qemu_ram_alloc_from_fd(size, size, NULL, mr, ram_flags, fd, offset,
                                    false, errp);
     if (!block) {
+        close(fd);
         if (created) {
             unlink(mem_path);
         }
-        close(fd);
         return NULL;
     }
 
@@ -2435,7 +2497,7 @@ RAMBlock *qemu_ram_alloc_from_file(ram_addr_t size, MemoryRegion *mr,
 }
 #endif
 
-#ifdef CONFIG_POSIX
+#if defined(CONFIG_POSIX) || defined(_WIN32)
 /*
  * Create MAP_SHARED RAMBlocks by mmap'ing a file descriptor, so it can be
  * shared with another process if CPR is being used.  Use memfd if available
@@ -2450,11 +2512,15 @@ static int qemu_ram_get_shared_fd(const char *name, bool *reused, Error **errp)
         return fd;
     }
 
+#ifdef _WIN32
+    fd = qemu_shm_alloc(0, errp);
+#else
     if (qemu_memfd_check(0)) {
         fd = qemu_memfd_create(name, 0, 0, 0, 0, errp);
     } else {
         fd = qemu_shm_alloc(0, errp);
     }
+#endif
 
     if (fd >= 0 && !cpr_save_fd(name, 0, fd, errp)) {
         close(fd);
@@ -2484,8 +2550,8 @@ RAMBlock *qemu_ram_alloc_internal(ram_addr_t size, ram_addr_t max_size,
     assert(!host ^ (ram_flags & RAM_PREALLOC));
     assert(max_size >= size);
 
-    /* ignore RAM_SHARED for Windows and emscripten*/
-#if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)
+    /* ignore RAM_SHARED for emscripten */
+#if (defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)) || defined(_WIN32)
     if (!host) {
         if (!share_flags && current_machine->aux_ram_share) {
             ram_flags |= RAM_SHARED;
@@ -2582,7 +2648,7 @@ static void reclaim_ramblock(RAMBlock *block)
         ;
     } else if (xen_map_cache_enabled()) {
         xen_invalidate_map_cache_entry(block->host);
-#if !defined(_WIN32) && !defined(EMSCRIPTEN)
+#if !defined(EMSCRIPTEN)
     } else if (block->fd >= 0) {
         qemu_ram_munmap(block->fd, block->host, block->max_length);
         close(block->fd);

@@ -98,8 +98,8 @@ struct tm *localtime_r(const time_t *timep, struct tm *result);
 #endif /* _POSIX_THREAD_SAFE_FUNCTIONS */
 
 static inline void os_setup_signal_handling(void) {}
-static inline void os_daemonize(void) {}
-static inline void os_setup_post(void) {}
+void os_daemonize(void);
+void os_setup_post(void);
 static inline void os_set_proc_name(const char *dummy) {}
 void os_set_line_buffering(void);
 void os_setup_early_signal_handling(void);
@@ -110,18 +110,8 @@ int getpagesize(void);
 # define EPROTONOSUPPORT EINVAL
 #endif
 
-static inline int os_set_daemonize(bool d)
-{
-    if (d) {
-        return -ENOTSUP;
-    }
-    return 0;
-}
-
-static inline bool is_daemonized(void)
-{
-    return false;
-}
+int os_set_daemonize(bool d);
+bool is_daemonized(void);
 
 static inline int os_mlock(bool on_fault G_GNUC_UNUSED)
 {
