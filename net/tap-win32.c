@@ -893,8 +893,11 @@ static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
         goto out;
     }
     CloseHandle(pi.hThread);
-    close(sv[1]);
-    sv[1] = -1;
+    /*
+     * our copy of the end of the helper stays open until its frame came:
+     * closing it while the helper starts may cut the connection; the end
+     * of the helper is seen on its process handle
+     */
 
     /*
      * Wait for the frame or for the end of the helper: a socket inherited by
@@ -948,15 +951,23 @@ static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
 
         WaitForSingleObject(pi.hProcess, 10000);
         GetExitCodeProcess(pi.hProcess, &code);
+        if (code == STILL_ACTIVE) {
+            TerminateProcess(pi.hProcess, 1);
+            error_setg(errp, "bridge helper sent no handle (%s)",
+                       n < 0 ? strerror(errno) : "end of stream");
+        } else {
+            error_setg(errp, "bridge helper failed (exit code %lu)",
+                       (unsigned long)code);
+        }
         CloseHandle(pi.hProcess);
-        error_setg(errp, "bridge helper failed (exit code %lu)",
-                   (unsigned long)code);
         ret = NULL;
         goto out;
     }
     /* our end stays open: the helper sees it close when QEMU ends */
     *process = pi.hProcess;
     sv[0] = -1;
+    close(sv[1]);
+    sv[1] = -1;
 out:
     if (attrs) {
         DeleteProcThreadAttributeList(attrs);

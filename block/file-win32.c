@@ -73,6 +73,7 @@ typedef struct BDRVRawState {
 
     /* SCSI pass-through (SG_IO, see include/scsi/sg-win32.h) */
     PRManager *pr_mgr;
+    HANDLE sg_handle;   /* read-write, when the device is opened read-only */
 } BDRVRawState;
 
 typedef struct BDRVRawReopenState {
@@ -749,6 +750,10 @@ static void raw_close(BlockDriverState *bs)
     }
 
     CloseHandle(s->hfile);
+    if (s->sg_handle) {
+        CloseHandle(s->sg_handle);
+        s->sg_handle = NULL;
+    }
     if (bs->open_flags & BDRV_O_TEMPORARY) {
         unlink(bs->filename);
     }
@@ -1136,7 +1141,7 @@ static void hdev_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.has_variable_length = true;
 
     /* what the adapter takes in one command, for SG_IO */
-    win32_sg_limits(s->hfile, &max_transfer, &max_iov);
+    win32_sg_limits(s->sg_handle ?: s->hfile, &max_transfer, &max_iov);
     if (max_transfer) {
         bs->bl.max_hw_transfer = max_transfer;
     }
@@ -1162,7 +1167,7 @@ static int coroutine_fn
 hdev_co_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
 {
     BDRVRawState *s = bs->opaque;
-    HdevIoctlData d = { s->hfile, req, buf };
+    HdevIoctlData d = { s->sg_handle ?: s->hfile, req, buf };
 
     if (req == SG_IO) {
         struct sg_io_hdr *io_hdr = buf;
@@ -1255,8 +1260,41 @@ static int hdev_open(BlockDriverState *bs, QDict *options, int flags,
         goto done;
     }
 
+    /*
+     * Read-only: the pass-through of Windows needs write access, which
+     * Linux does not ask from root (CAP_SYS_RAWIO).  A read-write handle
+     * serves SG_IO; the read-only one serves reads and goes to the
+     * persistent reservation helper, which refuses PR OUT on it as it
+     * does on a read-only descriptor.  Our read-write handle shares only
+     * reading: nobody else can write while we hold it.
+     */
+    if (!(flags & BDRV_O_RDWR) && s->type != FTYPE_FILE &&
+        win32_sg_probe(s->hfile)) {
+        HANDLE rw;
+
+        CloseHandle(s->hfile);
+        rw = CreateFile(filename, GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ, NULL, create_flags, overlapped, NULL);
+        s->hfile = CreateFile(filename, access_flags,
+                              FILE_SHARE_READ |
+                              (rw != INVALID_HANDLE_VALUE ? FILE_SHARE_WRITE
+                                                          : 0),
+                              NULL, create_flags, overlapped, NULL);
+        if (s->hfile == INVALID_HANDLE_VALUE) {
+            error_setg_win32(errp, GetLastError(), "Could not open device");
+            if (rw != INVALID_HANDLE_VALUE) {
+                CloseHandle(rw);
+            }
+            ret = -EINVAL;
+            goto done;
+        }
+        if (rw != INVALID_HANDLE_VALUE) {
+            s->sg_handle = rw;
+        }
+    }
+
     /* as /dev/sgN: a SCSI device that is not a disk takes only SG_IO */
-    bs->sg = s->type == FTYPE_SG && win32_sg_probe(s->hfile);
+    bs->sg = s->type == FTYPE_SG && win32_sg_probe(s->sg_handle ?: s->hfile);
 
     {
         const char *pr = qemu_opt_get(opts, "pr-manager");
@@ -1265,6 +1303,10 @@ static int hdev_open(BlockDriverState *bs, QDict *options, int flags,
             s->pr_mgr = pr_manager_lookup(pr, errp);
             if (!s->pr_mgr) {
                 CloseHandle(s->hfile);
+                if (s->sg_handle) {
+                    CloseHandle(s->sg_handle);
+                    s->sg_handle = NULL;
+                }
                 ret = -EINVAL;
                 goto done;
             }

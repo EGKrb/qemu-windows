@@ -168,6 +168,45 @@ static void copy_data(sg_io_hdr_t *hdr, uint8_t *buf, size_t len, bool in)
     }
 }
 
+/* PERSISTENT_RESERVE_COMMAND of ntddstor.h for PR IN (MSVC layout) */
+typedef struct {
+    ULONG Version;
+    ULONG Size;
+    UCHAR ServiceAction;    /* 5 bits */
+    UCHAR Reserved;
+    USHORT AllocationLength;
+} PRInCommand;
+
+/*
+ * PERSISTENT RESERVE IN on a handle opened read-only: the pass-through of
+ * Windows needs write access, IOCTL_STORAGE_PERSISTENT_RESERVE_IN does not
+ */
+static int sg_pr_in_readonly(HANDLE h, sg_io_hdr_t *hdr)
+{
+    PRInCommand cmd = { 0 };
+    size_t len = MIN(hdr->dxfer_len, (size_t)(hdr->cmdp[7] << 8 | hdr->cmdp[8]));
+    g_autofree uint8_t *buf = g_malloc0(MAX(len, 8));
+    DWORD ret = 0;
+
+    cmd.Version = sizeof(cmd);
+    cmd.Size = sizeof(cmd);
+    cmd.ServiceAction = hdr->cmdp[1] & 0x1f;
+    cmd.AllocationLength = len;
+    if (!ioctl_wait(h, IOCTL_STORAGE_PERSISTENT_RESERVE_IN, &cmd, sizeof(cmd),
+                    buf, len, &ret)) {
+        return -errno_of(GetLastError());
+    }
+    memset(&hdr->status, 0, offsetof(sg_io_hdr_t, info) -
+           offsetof(sg_io_hdr_t, status) + sizeof(hdr->info));
+    if (hdr->iovec_count) {
+        copy_data(hdr, buf, MIN(ret, len), true);
+    } else {
+        memcpy(hdr->dxferp, buf, MIN(ret, len));
+    }
+    hdr->resid = hdr->dxfer_len - MIN(ret, len);
+    return 0;
+}
+
 static int sg_io(HANDLE h, sg_io_hdr_t *hdr)
 {
     SPTDWithSense s = { 0 };
@@ -245,6 +284,11 @@ static int sg_io(HANDLE h, sg_io_hdr_t *hdr)
     hdr->resid = 0;
     hdr->info = SG_INFO_OK;
 
+    if (!ok && err == ERROR_ACCESS_DENIED && hdr->cmdp[0] == 0x5e &&
+        hdr->dxfer_direction == SG_DXFER_FROM_DEV) {
+        qemu_vfree(buf);
+        return sg_pr_in_readonly(h, hdr);
+    }
     if (!ok) {
         /* errors of the transport: Linux reports them in host_status */
         if (err == ERROR_SEM_TIMEOUT || err == WAIT_TIMEOUT) {

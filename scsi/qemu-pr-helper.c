@@ -158,7 +158,16 @@ static int do_sgio_worker(void *opaque)
     io_hdr.cmdp = (uint8_t *)data->cdb;
     io_hdr.sbp = data->sense;
     io_hdr.mx_sb_len = PR_HELPER_SENSE_SIZE;
+#ifdef _WIN32
+    /*
+     * Windows counts pass-through timeouts in whole seconds and resets
+     * the unit when one expires: give the device the time QEMU gives
+     * other pass-through commands (30 s), not 1 ms
+     */
+    io_hdr.timeout = 30000;
+#else
     io_hdr.timeout = 1;
+#endif
     io_hdr.dxfer_direction = data->dir;
     io_hdr.dxferp = (char *)data->buf;
     io_hdr.dxfer_len = data->sz;
