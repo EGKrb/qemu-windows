@@ -42,7 +42,7 @@ Windows does not have; what replaces it, if anything).
 | --- | --- |
 | image locking (`locking=on|auto`) | **done**: the bytes of file-posix.c, locked with `LockFileEx` past 2^62 (Windows locks are mandatory); `qemu-img info` refuses an image in use, `-U` forces |
 | `aio=native` (linux-aio), `io_uring` | Windows overlapped I/O (`aio=native`) as upstream; IoRing **todo** |
-| FUSE export (`qemu-storage-daemon --export fuse`) | **done**, on WinFsp's native API (loaded at run time): `mountpoint` is a drive letter or a directory that does not exist (Windows file systems are not mounted over a file), which holds the image as one file named after the export id; `writable`, `growable`, `allow-other`. Test in a VM with WinFsp |
+| FUSE export (`qemu-storage-daemon --export fuse`) | **done**, on WinFsp's native API (loaded at run time): `mountpoint` is a drive letter or a directory that does not exist (Windows file systems are not mounted over a file), which holds the image as one file named after the export id; `writable`, `growable`, `allow-other`. Tested in a Windows 11 VM with WinFsp (13 checks: directory and drive letter, read, write, read-only, growable, unmount) |
 | vhost-user-blk export | **done** (`qemu-storage-daemon --export type=vhost-user-blk`, with `vhost-user-blk-pci`); VDUSE export **todo** |
 | `host_device`, `host_cdrom` | `\\.\PhysicalDriveN`, `\\.\X:` as upstream |
 
