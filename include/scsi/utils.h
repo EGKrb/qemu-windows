@@ -3,6 +3,8 @@
 
 #ifdef CONFIG_LINUX
 #include <scsi/sg.h>
+#elif defined(_WIN32)
+#include "scsi/sg-win32.h"
 #endif
 
 #define SCSI_CMD_BUF_SIZE      16
@@ -135,8 +137,8 @@ uint32_t scsi_data_cdb_xfer(uint8_t *buf);
 uint32_t scsi_cdb_xfer(uint8_t *buf);
 int scsi_cdb_length(uint8_t *buf);
 
-/* Linux SG_IO interface.  */
-#ifdef CONFIG_LINUX
+/* Linux SG_IO interface (and its Windows version).  */
+#if defined(CONFIG_LINUX) || defined(_WIN32)
 #define SG_ERR_DRIVER_TIMEOUT  0x06
 #define SG_ERR_DRIVER_SENSE    0x08
 #endif

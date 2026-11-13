@@ -20,15 +20,27 @@
 
 #include "qemu/osdep.h"
 #include <getopt.h>
+#ifdef _WIN32
+/*
+ * Windows: the device comes as a handle (qemu/win32-fdpass.h), SG_IO is
+ * the SCSI pass-through of Windows (scsi/sg-win32.h)
+ */
+#include "scsi/sg-win32.h"
+#include "qemu/win32-fdpass.h"
+#include <winternl.h>
+#else
 #include <sys/ioctl.h>
 #include <linux/dm-ioctl.h>
 #include <scsi/sg.h>
+#endif
 
 #ifdef CONFIG_LIBCAP_NG
 #include <cap-ng.h>
 #endif
+#ifndef _WIN32
 #include <pwd.h>
 #include <grp.h>
+#endif
 
 #ifdef CONFIG_MPATH
 #include <libudev.h>
@@ -49,6 +61,7 @@
 #include "qapi/util.h"
 #include "qobject/qstring.h"
 #include "io/channel-socket.h"
+#include "qemu/sockets.h"
 #include "trace/control.h"
 #include "qemu/version.h"
 
@@ -149,7 +162,15 @@ static int do_sgio_worker(void *opaque)
     io_hdr.dxfer_direction = data->dir;
     io_hdr.dxferp = (char *)data->buf;
     io_hdr.dxfer_len = data->sz;
+#ifdef _WIN32
+    ret = win32_sg_ioctl(w32fd_token_handle(data->fd), SG_IO, &io_hdr);
+    if (ret < 0) {
+        errno = -ret;
+        ret = -1;
+    }
+#else
     ret = ioctl(data->fd, SG_IO, &io_hdr);
+#endif
 
     if (ret < 0) {
         status = scsi_sense_from_errno(errno, &sense_code);
@@ -648,6 +669,34 @@ static int coroutine_fn multipath_pr_cleanup(int bdev_fd, uint8_t *sense,
 }
 #endif
 
+/* Whether the device was opened read-only by QEMU */
+static bool prh_fd_is_readonly(int fd)
+{
+#ifdef _WIN32
+    PUBLIC_OBJECT_BASIC_INFORMATION info;
+    ULONG len;
+
+    if (NtQueryObject(w32fd_token_handle(fd), ObjectBasicInformation,
+                      &info, sizeof(info), &len) < 0) {
+        return false;
+    }
+    return !(info.GrantedAccess & FILE_WRITE_DATA);
+#else
+    return (fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY;
+#endif
+}
+
+static void prh_close_fd(int fd)
+{
+#ifdef _WIN32
+    if (w32fd_is_token(fd)) {
+        CloseHandle(w32fd_token_handle(fd));
+        return;
+    }
+#endif
+    close(fd);
+}
+
 static int coroutine_fn do_pr_in(int fd, const uint8_t *cdb, uint8_t *sense,
                                  uint8_t *data, int *resp_sz)
 {
@@ -671,7 +720,7 @@ static int coroutine_fn do_pr_out(int fd, const uint8_t *cdb, uint8_t *sense,
 {
     int resp_sz;
 
-    if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {
+    if (prh_fd_is_readonly(fd)) {
         scsi_build_sense(sense, SENSE_CODE(INVALID_OPCODE));
         return CHECK_CONDITION;
     }
@@ -689,7 +738,7 @@ static int coroutine_fn do_pr_out(int fd, const uint8_t *cdb, uint8_t *sense,
 
 static int coroutine_fn do_pr_cleanup(int fd, uint8_t *sense, Error **errp)
 {
-    if ((fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {
+    if (prh_fd_is_readonly(fd)) {
         scsi_build_sense(sense, SENSE_CODE(INVALID_OPCODE));
         return CHECK_CONDITION;
     }
@@ -750,7 +799,7 @@ static int coroutine_fn prh_read(PRHelperClient *client, void *buf, int sz,
                 if (client->fd == -1) {
                     client->fd = fds[i];
                 } else {
-                    close(fds[i]);
+                    prh_close_fd(fds[i]);
                     too_many = true;
                 }
             }
@@ -769,7 +818,7 @@ static int coroutine_fn prh_read(PRHelperClient *client, void *buf, int sz,
 
 err:
     if (client->fd != -1) {
-        close(client->fd);
+        prh_close_fd(client->fd);
         client->fd = -1;
     }
     return ret;
@@ -816,7 +865,7 @@ static int coroutine_fn prh_read_request(PRHelperClient *client,
     return sz;
 
 out_close:
-    close(client->fd);
+    prh_close_fd(client->fd);
     client->fd = -1;
     return -1;
 }
@@ -910,7 +959,7 @@ static void coroutine_fn prh_co_entry(void *opaque)
             abort();
         }
         num_active_sockets--;
-        close(req.fd);
+        prh_close_fd(req.fd);
         if (r == -1) {
             break;
         }
@@ -944,6 +993,10 @@ static gboolean accept_client(QIOChannel *ioc, GIOCondition cond, gpointer opaqu
     if (!cioc) {
         return TRUE;
     }
+#ifdef _WIN32
+    /* the handles of the devices come in frames */
+    qio_channel_socket_set_handle_passing(cioc);
+#endif
 
     prh = g_new(PRHelperClient, 1);
     prh->ioc = cioc;
@@ -959,6 +1012,15 @@ static void termsig_handler(int signum)
     qatomic_cmpxchg(&state, RUNNING, TERMINATE);
     qemu_notify_event();
 }
+
+#ifdef _WIN32
+/* Ctrl+C, Ctrl+Break, closing the console, logoff, shutdown */
+static BOOL WINAPI termsig_ctrl_handler(DWORD type)
+{
+    termsig_handler(SIGTERM);
+    return TRUE;
+}
+#endif
 
 static void close_server_socket(void)
 {
@@ -1029,6 +1091,9 @@ int main(int argc, char **argv)
     bool socket_path_specified = false;
     unsigned socket_activation;
 
+#ifdef _WIN32
+    SetConsoleCtrlHandler(termsig_ctrl_handler, TRUE);
+#else
     struct sigaction sa_sigterm;
     memset(&sa_sigterm, 0, sizeof(sa_sigterm));
     sa_sigterm.sa_handler = termsig_handler;
@@ -1037,8 +1102,13 @@ int main(int argc, char **argv)
     sigaction(SIGHUP, &sa_sigterm, NULL);
 
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     error_init(argv[0]);
+#ifdef _WIN32
+    /* Winsock, before the socket is made */
+    socket_init();
+#endif
     module_call_init(MODULE_INIT_TRACE);
     module_call_init(MODULE_INIT_QOM);
     qemu_add_opts(&qemu_trace_opts);
@@ -1052,7 +1122,7 @@ int main(int argc, char **argv)
             g_free(socket_path);
             socket_path = g_strdup(optarg);
             socket_path_specified = true;
-            if (socket_path[0] != '/') {
+            if (!g_path_is_absolute(socket_path)) {
                 error_report("socket path must be absolute");
                 exit(EXIT_FAILURE);
             }
@@ -1138,9 +1208,22 @@ int main(int argc, char **argv)
     multipath_pr_init();
 #endif
 
+#ifdef _WIN32
+    if (daemonize) {
+        os_set_daemonize(true);
+        os_daemonize();
+    }
+#endif
+
     socket_activation = check_socket_activation();
     if (socket_activation == 0) {
         SocketAddress saddr;
+#ifdef _WIN32
+        /* <local state dir>\run may not exist */
+        g_autofree char *dir = g_path_get_dirname(socket_path);
+
+        g_mkdir_with_parents(dir, 0700);
+#endif
         saddr = (SocketAddress){
             .type = SOCKET_ADDRESS_TYPE_UNIX,
             .u.q_unix.path = socket_path,
@@ -1181,16 +1264,27 @@ int main(int argc, char **argv)
                                          accept_client,
                                          NULL, NULL);
 
+#ifndef _WIN32
     if (daemonize) {
         if (daemon(0, 0) < 0) {
             error_report("Failed to daemonize: %s", strerror(errno));
             exit(EXIT_FAILURE);
         }
     }
+#endif
 
     if (daemonize || pidfile_specified) {
+#ifdef _WIN32
+        g_autofree char *dir = g_path_get_dirname(pidfile);
+
+        g_mkdir_with_parents(dir, 0700);
+#endif
         qemu_write_pidfile(pidfile, &error_fatal);
     }
+#ifdef _WIN32
+    /* the parent exits successfully now */
+    os_setup_post();
+#endif
 
 #ifdef CONFIG_LIBCAP_NG
     if (drop_privileges() < 0) {

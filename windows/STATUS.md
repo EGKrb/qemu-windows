@@ -61,6 +61,7 @@ Windows does not have; what replaces it, if anything).
 | Backend | Windows |
 | --- | --- |
 | user (slirp), socket, stream, dgram, hubport | same |
+| scsi-block, scsi-generic | **done** (VM test pending): SG_IO and the sg ioctls QEMU uses are IOCTL_SCSI_PASS_THROUGH_DIRECT and IOCTL_SCSI_GET_ADDRESS on `host_device` (`util/win32-sgio.c`, `include/scsi/sg-win32.h`); `\.\PhysicalDriveN`, `\.\CdRomN`, `\.\TapeN`, `\.\ChangerN` (tapes/changers are sg devices as /dev/sgN). Differences: no separate generic node on Windows (any pass-through device answers SG_GET_SCSI_ID); pass-through needs write access to the device (Windows), so read-only pass-through is refused; administrator rights to open disks |
 | tap, bridge | **done** (VM test pending): `ifname=` an adapter by name; no `ifname=` = a new adapter tapN, removed at the end (SetupAPI root\tap0901, `net/tap-win32-adapter.c`); `script=`/`downscript=` (.ps1/.bat/.cmd/.exe, default `etc\qemu-ifup`/`qemu-ifdown` with any of these extensions, `no`); `fd=`/`fds=` = an inherited handle number (overlapped); `helper=` and `-netdev bridge` = qemu-bridge-helper (handle sent over a socket pair). One queue: `queues>1`, `vnet_hdr=on` refused; `vhost=` needs the vhost-net driver (**todo**) |
 | vhost-user | **done**: both ends of the AF_UNIX socket frame the stream and duplicate handles into the peer (`util/win32-fdpass.c`, as SCM_RIGHTS would pass descriptors); `contrib/vhost-user-bridge` ported (tested: ping through it) |
 | vhost-net, vhost-vdpa, af-xdp, netmap, passt, l2tpv3, vde | **no** (Linux kernel or Linux-only programs) |
@@ -73,7 +74,7 @@ Windows does not have; what replaces it, if anything).
 | virtio-9p (`-virtfs`, `-fsdev local`) | **done**, every security model: the `*at()` functions on NT's relative opens (`NtCreateFile` with a root directory), POSIX renames and deletions (a file deleted while open, as on Linux), owner/mode/device as WSL keeps them (`$LXUID`, `$LXGID`, `$LXMOD`, `$LXDEV`), symbolic links, FIFOs, sockets and device nodes as WSL's reparse points (no privilege), extended attributes as NTFS EAs, names NTFS refuses mapped to U+F0xx as WSL and Cygwin do, directories made by the guest case sensitive |
 | TPM (`tpm-tis`, `tpm-crb`...) | **done**, built. `tpm-passthrough`: the TPM of the host through the TPM Base Services (`path=tbs`), to be tested in a VM. `tpm-emulator`: **done** with swtpm for Windows (`windows/swtpm`: libtpms 0.10.1 built with MinGW, the `swtpm socket` command line and control protocol, state in `--tpmstate dir=`); tested: a Linux guest sees a TPM 2.0, TPM2_GetRandom, PCRs measured by the firmware |
 | vfio, iommufd, vfio-user | **no** |
-| `input-linux`, `can-host-socketcan`, `pr-manager-helper` | **no** / **no** / **todo** (SCSI pass-through) |
+| `input-linux`, `can-host-socketcan`, `pr-manager-helper` | **no** / **no** / **done** (VM test pending): the handle of the device goes to qemu-pr-helper in a frame (`qio_channel_socket_set_handle_passing`) |
 | `secret_keyring` | **todo** (Credential Manager) |
 
 ## Programs
@@ -84,5 +85,5 @@ Windows does not have; what replaces it, if anything).
 | linux-user (`qemu-ARCH`) | **todo**: a native prototype for aarch64; otherwise through WSL |
 | bsd-user | **no** |
 | qemu-vnc | **done**: sockets given to QEMU as WSAPROTOCOL_INFOW (the Win32 D-Bus display API), Win32 map scanouts, AddClient; tested over a session bus |
-| qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, vhost-user backends of contrib | **done** (`qemu-bridge-helper-win32.c`: bridge.conf ACL, makes a TAP adapter, `netsh bridge add`, sends its handle, removes it when QEMU ends; needs administrator rights) / **todo** / **no** / vhost-user-bridge done, others **todo** |
+| qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, vhost-user backends of contrib | **done** (`qemu-bridge-helper-win32.c`: bridge.conf ACL, makes a TAP adapter, `netsh bridge add`, sends its handle, removes it when QEMU ends; needs administrator rights) / **done** (VM test pending: `scsi/qemu-pr-helper.c`, SG_IO of Windows on the handle QEMU sends; `--daemon` = os-win32-daemon.c; no multipath: device-mapper is Linux) / **no** / vhost-user-bridge done, others **todo** |
 | modules (`--enable-modules`) | **todo** (DLLs) |

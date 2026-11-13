@@ -47,6 +47,8 @@
 
 #ifdef __linux
 #include <scsi/sg.h>
+#elif defined(_WIN32)
+#include "scsi/sg-win32.h"
 #endif
 
 #define SCSI_WRITE_SAME_MAX         (512 * KiB)
@@ -2763,7 +2765,7 @@ static SCSIRequest *scsi_new_request(SCSIDevice *d, uint32_t tag, uint32_t lun,
     return req;
 }
 
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
 /*
  * Preempt on the SCSI Persistent Reservation on the source when migration
  * fails because the destination may have already preempted and we need to get
@@ -3296,7 +3298,7 @@ static const Property scsi_hd_properties[] = {
     DEFINE_BLOCK_CHS_PROPERTIES(SCSIDiskState, qdev.conf),
 };
 
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
 static bool scsi_disk_pr_state_post_load_errp(void *opaque, int version_id,
                                               Error **errp)
 {
@@ -3351,7 +3353,7 @@ static const VMStateDescription vmstate_scsi_disk_state = {
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
         &vmstate_scsi_disk_pr_state,
 #endif
         NULL
@@ -3423,7 +3425,7 @@ static const TypeInfo scsi_cd_info = {
     .class_init    = scsi_cd_class_initfn,
 };
 
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
 static const Property scsi_block_properties[] = {
     DEFINE_BLOCK_ERROR_PROPERTIES(SCSIDiskState, qdev.conf),
     DEFINE_PROP_DRIVE("drive", SCSIDiskState, qdev.conf.blk),
@@ -3471,7 +3473,7 @@ static void scsi_disk_register_types(void)
     type_register_static(&scsi_disk_base_info);
     type_register_static(&scsi_hd_info);
     type_register_static(&scsi_cd_info);
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
     type_register_static(&scsi_block_info);
 #endif
 }

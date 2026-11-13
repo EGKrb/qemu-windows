@@ -4629,6 +4629,14 @@ if have_tools
   endif
 
   if host_os == 'windows'
+    # SCSI persistent reservations: the handle of the device comes from
+    # QEMU, SG_IO is the SCSI pass-through of Windows
+    executable('qemu-pr-helper', files('scsi/qemu-pr-helper.c', 'scsi/utils.c',
+                                       'os-win32-daemon.c'),
+               dependencies: [authz, crypto, io, qom, qemuutil,
+                              cc.find_library('ntdll')],
+               install: true)
+
     # TAP-Windows adapters in a network bridge of Windows
     executable('qemu-bridge-helper',
                files('qemu-bridge-helper-win32.c', 'net/tap-win32-adapter.c'),

@@ -21,7 +21,11 @@
 #include "qemu/module.h"
 #include "qemu/bswap.h"
 
+#ifdef _WIN32
+#include "scsi/sg-win32.h"
+#else
 #include <scsi/sg.h>
+#endif
 #include "qom/object.h"
 
 #define PR_MAX_RECONNECT_ATTEMPTS 5
@@ -121,6 +125,10 @@ static int pr_manager_helper_initialize(PRManagerHelper *pr_mgr,
     }
 
     qio_channel_set_delay(QIO_CHANNEL(sioc), false);
+#ifdef _WIN32
+    /* the handle of the device goes to the helper in frames */
+    qio_channel_socket_set_handle_passing(sioc);
+#endif
     pr_mgr->ioc = QIO_CHANNEL(sioc);
 
     /* A simple feature negotiation protocol, even though there is

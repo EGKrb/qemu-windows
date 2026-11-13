@@ -36,12 +36,17 @@
 #include "qemu/iov.h"
 #include "qobject/qdict.h"
 #include "qobject/qstring.h"
+#include "qemu/win32-fdpass.h"
 #include <windows.h>
 #include <winioctl.h>
+#include "scsi/pr-manager.h"
+#include "scsi/constants.h"
+#include "scsi/utils.h"
 
 #define FTYPE_FILE 0
 #define FTYPE_CD     1
 #define FTYPE_HARDDISK 2
+#define FTYPE_SG       3    /* a SCSI device that is not a disk: tape... */
 
 typedef struct RawWin32AIOData {
     BlockDriverState *bs;
@@ -65,6 +70,9 @@ typedef struct BDRVRawState {
     uint64_t shared_perm;
     uint64_t locked_perm;
     uint64_t locked_shared_perm;
+
+    /* SCSI pass-through (SG_IO, see include/scsi/sg-win32.h) */
+    PRManager *pr_mgr;
 } BDRVRawState;
 
 typedef struct BDRVRawReopenState {
@@ -282,6 +290,11 @@ static QemuOptsList raw_runtime_opts = {
             .name = "locking",
             .type = QEMU_OPT_STRING,
             .help = "file locking mode (on/off/auto, default: auto)",
+        },
+        {
+            .name = "pr-manager",
+            .type = QEMU_OPT_STRING,
+            .help = "id of persistent reservation manager object (default: none)",
         },
         { /* end of list */ }
     },
@@ -799,7 +812,14 @@ static int64_t coroutine_fn raw_co_getlength(BlockDriverState *bs)
                                  NULL, 0, &dg, sizeof(dg), &count, NULL);
         if (status != 0) {
             l = dg.DiskSize;
+        } else {
+            /* no medium, or a device without geometry */
+            l.QuadPart = 0;
         }
+        break;
+    case FTYPE_SG:
+        /* as a /dev/sgN of Linux: no length */
+        l.QuadPart = 0;
         break;
     default:
         return -EIO;
@@ -1066,8 +1086,14 @@ static int find_device_type(BlockDriverState *bs, const char *filename)
 
     if (strstart(filename, "\\\\.\\", &p) ||
         strstart(filename, "//./", &p)) {
-        if (stristart(p, "PhysicalDrive", NULL))
+        if (stristart(p, "PhysicalDrive", NULL) ||
+            stristart(p, "CdRom", NULL)) {
             return FTYPE_HARDDISK;
+        }
+        if (stristart(p, "Tape", NULL) || stristart(p, "Changer", NULL) ||
+            stristart(p, "Scsi", NULL)) {
+            return FTYPE_SG;
+        }
         snprintf(s->drive_path, sizeof(s->drive_path), "%c:\\", p[0]);
         type = GetDriveType(s->drive_path);
         switch (type) {
@@ -1101,9 +1127,63 @@ static void hdev_parse_filename(const char *filename, QDict *options,
 
 static void hdev_refresh_limits(BlockDriverState *bs, Error **errp)
 {
+    BDRVRawState *s = bs->opaque;
+    size_t max_transfer;
+    int max_iov;
+
     /* XXX Does Windows support AIO on less than 512-byte alignment? */
     bs->bl.request_alignment = 512;
     bs->bl.has_variable_length = true;
+
+    /* what the adapter takes in one command, for SG_IO */
+    win32_sg_limits(s->hfile, &max_transfer, &max_iov);
+    if (max_transfer) {
+        bs->bl.max_hw_transfer = max_transfer;
+    }
+    if (max_iov) {
+        bs->bl.max_hw_iov = max_iov;
+    }
+}
+
+typedef struct HdevIoctlData {
+    HANDLE hfile;
+    unsigned long req;
+    void *buf;
+} HdevIoctlData;
+
+static int hdev_ioctl_worker(void *opaque)
+{
+    HdevIoctlData *d = opaque;
+
+    return win32_sg_ioctl(d->hfile, d->req, d->buf);
+}
+
+static int coroutine_fn
+hdev_co_ioctl(BlockDriverState *bs, unsigned long int req, void *buf)
+{
+    BDRVRawState *s = bs->opaque;
+    HdevIoctlData d = { s->hfile, req, buf };
+
+    if (req == SG_IO) {
+        struct sg_io_hdr *io_hdr = buf;
+
+        if (s->pr_mgr) {
+            if (io_hdr->cmdp[0] == PERSISTENT_RESERVE_OUT ||
+                io_hdr->cmdp[0] == PERSISTENT_RESERVE_IN ||
+                io_hdr->cmdp[0] == PR_HELPER_CLEANUP) {
+                /* the handle goes to qemu-pr-helper as a handle token */
+                return pr_manager_execute(s->pr_mgr,
+                                          qemu_get_current_aio_context(),
+                                          w32fd_handle_token(s->hfile),
+                                          io_hdr);
+            }
+        } else if (io_hdr->cmdp[0] == PR_HELPER_CLEANUP) {
+            /* This is a nop without pr-manager */
+            io_hdr->status = GOOD;
+            return 0;
+        }
+    }
+    return thread_pool_submit_co(hdev_ioctl_worker, &d);
 }
 
 static int hdev_open(BlockDriverState *bs, QDict *options, int flags,
@@ -1175,6 +1255,22 @@ static int hdev_open(BlockDriverState *bs, QDict *options, int flags,
         goto done;
     }
 
+    /* as /dev/sgN: a SCSI device that is not a disk takes only SG_IO */
+    bs->sg = s->type == FTYPE_SG && win32_sg_probe(s->hfile);
+
+    {
+        const char *pr = qemu_opt_get(opts, "pr-manager");
+
+        if (pr) {
+            s->pr_mgr = pr_manager_lookup(pr, errp);
+            if (!s->pr_mgr) {
+                CloseHandle(s->hfile);
+                ret = -EINVAL;
+                goto done;
+            }
+        }
+    }
+
 done:
     qemu_opts_del(opts);
     return ret;
@@ -1190,6 +1286,7 @@ static BlockDriver bdrv_host_device = {
     .bdrv_open              = hdev_open,
     .bdrv_close             = raw_close,
     .bdrv_refresh_limits    = hdev_refresh_limits,
+    .bdrv_co_ioctl          = hdev_co_ioctl,
 
     .bdrv_aio_preadv    = raw_aio_preadv,
     .bdrv_aio_pwritev   = raw_aio_pwritev,

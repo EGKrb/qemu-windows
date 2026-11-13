@@ -25,9 +25,13 @@
 #include "system/block-backend.h"
 #include "trace.h"
 
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
 
+#ifdef _WIN32
+#include "scsi/sg-win32.h"
+#else
 #include <scsi/sg.h>
+#endif
 #include "scsi/constants.h"
 
 #ifndef MAX_UINT
@@ -1268,4 +1272,4 @@ static void scsi_generic_register_types(void)
 
 type_init(scsi_generic_register_types)
 
-#endif /* __linux__ */
+#endif /* __linux__ || _WIN32 */

@@ -10,7 +10,11 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef _WIN32
+#include "scsi/sg-win32.h"
+#else
 #include <scsi/sg.h>
+#endif
 
 #include "qapi/error.h"
 #include "qemu/aio.h"

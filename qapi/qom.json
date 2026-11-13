@@ -832,7 +832,7 @@
 ##
 { 'struct': 'PrManagerHelperProperties',
   'data': { 'path': 'str' },
-  'if': 'CONFIG_LINUX' }
+  'if': { 'any': [ 'CONFIG_LINUX', 'CONFIG_WIN32' ] } }
 
 ##
 # @QtestProperties:
@@ -1286,7 +1286,7 @@
     'monitor-qmp',
     'pef-guest',
     { 'name': 'pr-manager-helper',
-      'if': 'CONFIG_LINUX' },
+      'if': { 'any': [ 'CONFIG_LINUX', 'CONFIG_WIN32' ] } },
     'qtest',
     'rng-builtin',
     'rng-egd',
@@ -1363,7 +1363,8 @@
       'monitor-hmp':                'MonitorHMPProperties',
       'monitor-qmp':                'MonitorQMPProperties',
       'pr-manager-helper':          { 'type': 'PrManagerHelperProperties',
-                                      'if': 'CONFIG_LINUX' },
+                                      'if': { 'any': [ 'CONFIG_LINUX',
+                                                       'CONFIG_WIN32' ] } },
       'qtest':                      'QtestProperties',
       'rng-egd':                    'RngEgdProperties',
       'rng-random':                 'RngRandomProperties',

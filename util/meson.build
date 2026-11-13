@@ -26,6 +26,7 @@ else
   util_ss.add(files('mmap-alloc-win32.c'))
   util_ss.add(files('win32-fdpass.c'))
   util_ss.add(files('memfd-win32.c'))
+  util_ss.add(files('win32-sgio.c'))
   util_ss.add(files('qemu-thread-win32.c'))
   util_ss.add(winmm, pathcch, synchronization)
 endif
