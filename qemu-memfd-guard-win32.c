@@ -17,10 +17,11 @@
  * a named event Local\qemu-memfd-<volume>-<index>, which close() of QEMU
  * sets after closing a sealed memfd, and which a guard sets for all its
  * memfds when its parent ends (its pipe closes); guards wait on it in the
- * thread pool.  A program that is not QEMU closes without telling: a check
- * every 100 ms catches that (Windows gives no notice of the last close of
- * a locked file: oplocks, the only such notice, cannot be held on a file
- * with byte-range locks).
+ * thread pool.  A program that is not QEMU closes without telling us: the
+ * memfd is deleted with the POSIX semantics of Windows (qemu_shm_alloc()),
+ * so its name leaves its directory at its last close, which the guard
+ * watches (ReadDirectoryChangesW): told at once too.  A check every 100 ms
+ * remains for file systems without POSIX deletion.
  *
  * Messages on the pipe (standard input): { uint64 handle in the guard,
  * uint32 seals, uint32 0 }; the guard answers each with one byte on its
@@ -51,6 +52,7 @@ typedef struct {
 } GuardMsg;
 
 typedef struct Guarded {
+    wchar_t dir[MAX_PATH];  /* its directory, watched */
     HANDLE file;            /* our own open of the memfd's file */
     HANDLE section;
     HANDLE event;           /* Local\qemu-memfd-<volume>-<index> */
@@ -98,14 +100,89 @@ static void enforce(Guarded *g, uint32_t seals)
     g->seals |= seals;
 }
 
-/* Every last descriptor of the memfd closed: Windows deletes it */
+/*
+ * Every last descriptor of the memfd closed: Windows deletes it (delete
+ * pending, or no name left with POSIX deletion)
+ */
 static bool ended(Guarded *g)
 {
     FILE_STANDARD_INFO si;
 
     return !GetFileInformationByHandleEx(g->file, FileStandardInfo, &si,
-                                         sizeof(si)) || si.DeletePending;
+                                         sizeof(si)) ||
+           si.DeletePending || si.NumberOfLinks == 0;
 }
+
+/*
+ * Directories of memfds, watched: a name that goes is a memfd that ended
+ * (POSIX deletion): look at once at those of that directory
+ */
+typedef struct Watched {
+    wchar_t dir[MAX_PATH];
+    struct Watched *next;
+} Watched;
+
+static Watched *watched;
+
+static void release(Guarded *g);
+
+static DWORD WINAPI dir_watcher(void *opaque)
+{
+    Watched *w = opaque;
+    HANDLE d = CreateFileW(w->dir, FILE_LIST_DIRECTORY,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE |
+                           FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    DWORD buf[1024], n;
+    Guarded *g;
+
+    if (d == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    /* overflows report 0 bytes: we look at every memfd of it anyway */
+    while (ReadDirectoryChangesW(d, buf, sizeof(buf), FALSE,
+                                 FILE_NOTIFY_CHANGE_FILE_NAME, &n, NULL,
+                                 NULL)) {
+        EnterCriticalSection(&lock);
+        for (g = guarded; g; g = g->next) {
+            if (!g->released && !wcscmp(g->dir, w->dir) && ended(g)) {
+                release(g);
+            }
+        }
+        LeaveCriticalSection(&lock);
+    }
+    CloseHandle(d);
+    return 0;
+}
+
+/* With the lock held */
+static void watch_dir(const wchar_t *dir)
+{
+    Watched *w;
+    HANDLE t;
+
+    for (w = watched; w; w = w->next) {
+        if (!wcscmp(w->dir, dir)) {
+            return;
+        }
+    }
+    w = calloc(1, sizeof(*w));
+    if (!w) {
+        return;
+    }
+    wcsncpy(w->dir, dir, MAX_PATH - 1);
+    t = CreateThread(NULL, 0, dir_watcher, w, 0, NULL);
+    if (!t) {
+        free(w);
+        return;
+    }
+    CloseHandle(t);
+    w->next = watched;
+    watched = w;
+}
+
+/* QEMU_MEMFD_GUARD_LOG: when each memfd is let go (for the tests) */
+static FILE *release_log;
 
 /* Let @g go (with the lock held): the file goes with our open */
 static void release(Guarded *g)
@@ -114,6 +191,15 @@ static void release(Guarded *g)
         return;
     }
     g->released = true;
+    if (release_log) {
+        LARGE_INTEGER t, f;
+
+        QueryPerformanceCounter(&t);
+        QueryPerformanceFrequency(&f);
+        fprintf(release_log, "released %016llx %.3f\n",
+                (unsigned long long)g->index, t.QuadPart * 1000.0 / f.QuadPart);
+        fflush(release_log);
+    }
     /* a pending wait is unregistered by the main loop, before freeing */
     if (g->section) {
         CloseHandle(g->section);
@@ -203,6 +289,15 @@ static void guard(HANDLE dup, uint32_t seals)
     swprintf(name, 64, L"Local\\qemu-memfd-%08llx-%016llx",
              (unsigned long long)g->volume, (unsigned long long)g->index);
     g->event = CreateEventW(NULL, TRUE, FALSE, name);
+    /* its directory: \\?\C:\...\qemu-memfd\name, cut at the last \\ */
+    if (GetFinalPathNameByHandleW(h, g->dir, MAX_PATH, 0)) {
+        wchar_t *slash = wcsrchr(g->dir, L'\\');
+
+        if (slash) {
+            *slash = 0;
+            watch_dir(g->dir);
+        }
+    }
     enforce(g, seals);
     g->next = guarded;
     guarded = g;
@@ -261,6 +356,9 @@ int main(void)
         return 1;
     }
     InitializeCriticalSection(&lock);
+    if (getenv("QEMU_MEMFD_GUARD_LOG")) {
+        release_log = fopen(getenv("QEMU_MEMFD_GUARD_LOG"), "a");
+    }
     t = CreateThread(NULL, 0, reader, in, 0, NULL);
     if (!t) {
         return 1;

@@ -912,10 +912,21 @@ void qemu_win32_map_free(void *ptr, HANDLE h, Error **errp)
  * (FILE_ATTRIBUTE_TEMPORARY), shared by mapping its handle, as the
  * unlinked POSIX shared memory object is.
  */
+/*
+ * Shared memory (memfd, memory-backend-shm): a temporary file in
+ * <temp>\qemu-memfd, deleted when its last handle is closed, with the
+ * POSIX semantics of Windows 10 1809 and later: its name goes at once,
+ * which tells the guards of sealed memfds (qemu-memfd-guard watches the
+ * directory) that it ended, whoever closed it.
+ */
 int qemu_shm_alloc(size_t size, Error **errp)
 {
     static int sequence;
-    wchar_t dir[MAX_PATH + 1], name[MAX_PATH + 64];
+    wchar_t dir[MAX_PATH + 1], name[MAX_PATH + 96];
+    /* FILE_DISPOSITION_INFO_EX: DELETE | POSIX_SEMANTICS | ON_CLOSE */
+    struct {
+        DWORD Flags;
+    } posix = { 0x1 | 0x2 | 0x8 };
     HANDLE h;
     int fd;
 
@@ -924,10 +935,18 @@ int qemu_shm_alloc(size_t size, Error **errp)
                          "directory for shared memory");
         return -1;
     }
-    swprintf(name, MAX_PATH + 64, L"%lsqemu-%lu-shm-%d-%08x", dir,
-             GetCurrentProcessId(), qatomic_fetch_inc(&sequence),
-             g_random_int());
-    h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE,
+    swprintf(name, MAX_PATH + 96, L"%lsqemu-memfd", dir);
+    if (CreateDirectoryW(name, NULL) ||
+        GetLastError() == ERROR_ALREADY_EXISTS) {
+        swprintf(name, MAX_PATH + 96, L"%lsqemu-memfd\\qemu-%lu-shm-%d-%08x",
+                 dir, GetCurrentProcessId(), qatomic_fetch_inc(&sequence),
+                 g_random_int());
+    } else {
+        swprintf(name, MAX_PATH + 96, L"%lsqemu-%lu-shm-%d-%08x", dir,
+                 GetCurrentProcessId(), qatomic_fetch_inc(&sequence),
+                 g_random_int());
+    }
+    h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE | DELETE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     NULL, CREATE_NEW,
                     FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
@@ -937,6 +956,10 @@ int qemu_shm_alloc(size_t size, Error **errp)
                          "failed to create shared memory");
         return -1;
     }
+    /* not supported (FAT, older Windows): classic delete on close */
+    SetFileInformationByHandle(h, (FILE_INFO_BY_HANDLE_CLASS)21
+                               /* FileDispositionInfoEx */, &posix,
+                               sizeof(posix));
     fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
     if (fd < 0) {
         CloseHandle(h);

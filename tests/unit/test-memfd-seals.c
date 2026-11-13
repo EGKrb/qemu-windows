@@ -42,27 +42,49 @@ static BOOL raw_truncate(HANDLE h, int64_t len)
     return SetFilePointerEx(h, li, NULL, FILE_BEGIN) && SetEndOfFile(h);
 }
 
-/*
- * Milliseconds until the file of a memfd is gone from its directory (its
- * memory freed: a file that is only delete pending is still listed), or -1
- */
-static double gone_after_ms(const wchar_t *path)
-{
-    LARGE_INTEGER f, t0, t;
-    WIN32_FIND_DATAW fd;
-    HANDLE h;
+static char *guard_log;
 
+static double now_ms(void)
+{
+    LARGE_INTEGER t, f;
+
+    QueryPerformanceCounter(&t);
     QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&t0);
-    do {
-        h = FindFirstFileW(path, &fd);
-        QueryPerformanceCounter(&t);
-        if (h == INVALID_HANDLE_VALUE) {
-            return (t.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+    return t.QuadPart * 1000.0 / f.QuadPart;
+}
+
+static uint64_t file_index(HANDLE h)
+{
+    BY_HANDLE_FILE_INFORMATION info;
+
+    g_assert_true(GetFileInformationByHandle(h, &info));
+    return (uint64_t)info.nFileIndexHigh << 32 | info.nFileIndexLow;
+}
+
+/*
+ * Milliseconds from @t0 until a guard let the memfd @index go (its memory
+ * freed), from the log of qemu-memfd-guard; -1 if not within 5 s
+ */
+static double released_after_ms(uint64_t index, double t0)
+{
+    g_autofree char *want = g_strdup_printf("released %016llx ",
+                                            (unsigned long long)index);
+
+    while (now_ms() - t0 < 5000) {
+        g_autofree char *log = NULL;
+        char *p;
+
+        if (g_file_get_contents(guard_log, &log, NULL, NULL)) {
+            for (p = strstr(log, want); p; p = strstr(p + 1, want)) {
+                double t = g_ascii_strtod(p + strlen(want), NULL);
+
+                if (t >= t0) {
+                    return t - t0;
+                }
+            }
         }
-        FindClose(h);
         SwitchToThread();
-    } while (t.QuadPart - t0.QuadPart < 5 * f.QuadPart);
+    }
     return -1;
 }
 
@@ -204,16 +226,19 @@ static void test_close(void)
     int fd = qemu_memfd_create("t", SZ, false, 0,
                                F_SEAL_SHRINK | F_SEAL_WRITE, &error_abort);
     wchar_t path[MAX_PATH];
-    double ms;
+    uint64_t index;
+    double ms, t0;
 
     g_assert(GetFinalPathNameByHandleW((HANDLE)_get_osfhandle(fd), path,
                                        MAX_PATH, 0));
     g_assert(GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES);
+    index = file_index((HANDLE)_get_osfhandle(fd));
     /* sealed and closed at once: the guard holds it already, then lets go */
+    t0 = now_ms();
     close(fd);
     /* close() tells the guard: at once, as on Linux */
-    ms = gone_after_ms(path);
-    g_test_message("gone %.1f ms after close()", ms);
+    ms = released_after_ms(index, t0);
+    g_test_message("released %.2f ms after close()", ms);
     g_assert_cmpfloat(ms, >=, 0);
     g_assert_cmpfloat(ms, <, 50);
 }
@@ -228,9 +253,9 @@ static void test_persist(void)
     int fd = qemu_memfd_create("t", 65536, false, 0,
                                F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK,
                                &error_abort);
-    wchar_t path[MAX_PATH];
+    uint64_t index;
     HANDLE dup;
-    double ms;
+    double ms, t0;
 
     g_assert_true(DuplicateHandle(GetCurrentProcess(),
                                   (HANDLE)_get_osfhandle(fd),
@@ -241,13 +266,18 @@ static void test_persist(void)
     g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
     g_assert_false(raw_write(dup, 65536, buf, 1));
     g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
-    /* the last handle closed without close() of QEMU: the guard's check */
-    g_assert(GetFinalPathNameByHandleW(dup, path, MAX_PATH, 0));
+    /*
+     * The last handle closed without close() of QEMU, as a program that is
+     * not QEMU does: the name of the memfd goes (POSIX deletion), which
+     * the guard watches
+     */
+    index = file_index(dup);
+    t0 = now_ms();
     CloseHandle(dup);
-    ms = gone_after_ms(path);
-    g_test_message("gone %.1f ms after CloseHandle()", ms);
+    ms = released_after_ms(index, t0);
+    g_test_message("released %.2f ms after CloseHandle()", ms);
     g_assert_cmpfloat(ms, >=, 0);
-    g_assert_cmpfloat(ms, <, 300);
+    g_assert_cmpfloat(ms, <, 50);
 }
 
 /*
@@ -295,7 +325,8 @@ static void test_guard(void)
     char buf[8] = "x";
     HANDLE h;
     int rfd;
-    double ms;
+    uint64_t index;
+    double ms, t0;
 
     if (g_test_subprocess()) {
         HANDLE parent = OpenProcess(PROCESS_DUP_HANDLE, FALSE,
@@ -344,10 +375,11 @@ static void test_guard(void)
     qemu_memfd_win32_received(rfd);
 
     /* nobody holds it any more: it ends */
-    g_assert(GetFinalPathNameByHandleW(h, path, MAX_PATH, 0));
+    index = file_index(h);
+    t0 = now_ms();
     close(rfd);
-    ms = gone_after_ms(path);
-    g_test_message("gone %.1f ms after the last close()", ms);
+    ms = released_after_ms(index, t0);
+    g_test_message("released %.2f ms after the last close()", ms);
     g_assert_cmpfloat(ms, >=, 0);
     g_assert_cmpfloat(ms, <, 50);
 }
@@ -355,6 +387,12 @@ static void test_guard(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    guard_log = g_build_filename(g_get_tmp_dir(), "qemu-memfd-guard-test.log",
+                                 NULL);
+    if (!g_test_subprocess()) {
+        g_remove(guard_log);
+    }
+    g_setenv("QEMU_MEMFD_GUARD_LOG", guard_log, TRUE);
     g_test_add_func("/memfd/no-sealing", test_no_sealing);
     g_test_add_func("/memfd/not-memfd", test_not_memfd);
     g_test_add_func("/memfd/bad-seals", test_bad_seals);
