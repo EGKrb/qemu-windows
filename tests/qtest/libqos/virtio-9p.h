@@ -22,6 +22,10 @@
 #include "qgraph.h"
 #include "virtio.h"
 #include "virtio-pci.h"
+#ifdef _WIN32
+/* the stat() of the C runtime, not the one of the 9p server */
+#define P9_WIN32_CLIENT
+#endif
 #include "hw/9pfs/9p.h"
 
 typedef struct QVirtio9P QVirtio9P;

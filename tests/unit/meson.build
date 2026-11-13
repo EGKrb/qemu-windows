@@ -52,6 +52,11 @@ tests = {
   'test-envlist': [],
 }
 
+if host_os == 'windows'
+  # memfd seals on Windows (util/memfd-win32.c)
+  tests += {'test-memfd-seals': []}
+endif
+
 if have_system or have_tools
   tests += {
     'test-qmp-event': [testqapi],

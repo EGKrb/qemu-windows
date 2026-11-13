@@ -23,7 +23,7 @@ Windows does not have; what replaces it, if anything).
 | --- | --- |
 | `memory-backend-file`, `-mem-path` (file or directory) | **done**: file mappings (`CreateFileMapping`/`MapViewOfFile`); a directory gets a temporary file deleted on close; offsets in multiples of 64 KiB |
 | `memory-backend-shm`, `memory-backend-ram,share=on`, `-machine aux-ram-share=on` | **done**: temporary delete-on-close file kept in cache |
-| `memory-backend-memfd` | **done**: a delete-on-close file kept in cache (no seals, no huge pages) |
+| `memory-backend-memfd`, memfd seals | **done**: a delete-on-close file kept in cache; seals (`seal=on`, F_ADD_SEALS/F_GET_SEALS as `qemu_memfd_add_seals()`/`qemu_memfd_get_seals()`) are an extended attribute of the file, so every process that has it reads them, and the kernel of Windows enforces them for every handle while the process that sealed keeps it open: SHRINK = a section of the file (no truncation under a section), WRITE/FUTURE_WRITE = a shared lock of every byte, GROW = a shared lock past the end; mmap()/ftruncate() refuse what Linux refuses (EPERM, EBUSY). Test: `tests/unit/test-memfd-seals.c`. No huge pages |
 | hugetlbfs, `guest-memfd`, `memory-backend-epc` (SGX) | **todo** (large pages need SeLockMemoryPrivilege) / **no** |
 | `discard-data`, discard of file-backed RAM | **todo** |
 
@@ -87,3 +87,17 @@ Windows does not have; what replaces it, if anything).
 | qemu-vnc | **done**: sockets given to QEMU as WSAPROTOCOL_INFOW (the Win32 D-Bus display API), Win32 map scanouts, AddClient; tested over a session bus |
 | qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, vhost-user backends of contrib | **done** (`qemu-bridge-helper-win32.c`: bridge.conf ACL, makes a TAP adapter, `netsh bridge add`, sends its handle, removes it when QEMU ends; needs administrator rights) / **done** (VM test pending: `scsi/qemu-pr-helper.c`, SG_IO of Windows on the handle QEMU sends; `--daemon` = os-win32-daemon.c; no multipath: device-mapper is Linux) / **no** / vhost-user-bridge done, others **todo** |
 | modules (`--enable-modules`) | **todo** (DLLs) |
+
+## Tests of QEMU on Windows (qtests)
+
+Built and run on Windows: virtio-9p (39), vhost-user-blk (6), TPM with the
+emulator of the test and with swtpm (crb, tis, tis-device, tis-i2c, with
+migration), `tests/unit/test-memfd-seals`.  To run them by hand from a
+shell of MSYS2 or Git: `QTEST_QEMU_BINARY=./qemu-system-x86_64` (without
+`.exe`: the architecture is read from the name), and `MSYS_NO_PATHCONV=1`
+so that `-p /x86_64/...` reaches the program.  Windows differences handled
+for them: single quotes of the command lines (sh) become double quotes;
+a socket from accept() is blocking, as on POSIX (Windows inherits the
+WSAEventSelect of the listener); a reset of an AF_UNIX peer that ended
+reads as the end of the stream, as on Linux.
+

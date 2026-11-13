@@ -395,8 +395,35 @@ const char *qtest_qemu_binary(const char *var)
 }
 
 #ifdef _WIN32
-static pid_t qtest_create_process(char *cmd)
+/*
+ * The command lines of the tests are written for /bin/sh: 'single quotes'
+ * protect a value.  The C runtime of Windows only knows "double quotes":
+ * turn the first into the second ("..." inside become \").
+ */
+static char *qtest_win32_cmdline(const char *cmd)
 {
+    GString *out = g_string_new(NULL);
+    bool single = false, dbl = false;
+
+    for (; *cmd; cmd++) {
+        if (*cmd == '\'' && !dbl) {
+            single = !single;
+            g_string_append_c(out, '"');
+        } else if (*cmd == '"' && single) {
+            g_string_append(out, "\\\"");
+        } else {
+            if (*cmd == '"') {
+                dbl = !dbl;
+            }
+            g_string_append_c(out, *cmd);
+        }
+    }
+    return g_string_free(out, false);
+}
+
+static pid_t qtest_create_process(char *cmd_sh)
+{
+    g_autofree char *cmd = qtest_win32_cmdline(cmd_sh);
     STARTUPINFO si;
     PROCESS_INFORMATION pi;
     BOOL ret;

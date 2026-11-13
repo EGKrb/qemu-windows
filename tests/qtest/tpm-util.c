@@ -298,8 +298,12 @@ gboolean tpm_util_swtpm_start(const char *path, GPid *pid,
     (*addr)->type = SOCKET_ADDRESS_TYPE_UNIX;
     (*addr)->u.q_unix.path = g_build_filename(path, "sock", NULL);
 
-    succ = g_spawn_async(NULL, swtpm_argv, NULL, G_SPAWN_SEARCH_PATH,
-                         NULL, NULL, pid, error);
+    succ = g_spawn_async(NULL, swtpm_argv, NULL, G_SPAWN_SEARCH_PATH
+#ifdef _WIN32
+                         /* or GLib gives no handle: nothing to kill */
+                         | G_SPAWN_DO_NOT_REAP_CHILD
+#endif
+                         , NULL, NULL, pid, error);
 
     for (i = 0; swtpm_argv[i]; i++) {
         g_free(swtpm_argv[i]);
@@ -316,6 +320,13 @@ void tpm_util_swtpm_kill(GPid pid)
         return;
     }
 
+#ifdef _WIN32
+    /* a GPid is the handle of the process */
+    (void)n;
+    TerminateProcess(pid, 1);
+    WaitForSingleObject(pid, 5000);
+    g_spawn_close_pid(pid);
+#else
     g_spawn_close_pid(pid);
 
     n = kill(pid, 0);
@@ -324,6 +335,7 @@ void tpm_util_swtpm_kill(GPid pid)
     }
 
     kill(pid, SIGKILL);
+#endif
 }
 
 void tpm_util_migrate(QTestState *who, const char *uri)

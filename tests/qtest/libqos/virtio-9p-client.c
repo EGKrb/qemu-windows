@@ -430,7 +430,12 @@ TAttachRes v9fs_tattach(TAttachOpt opt)
     }
 
     if (!opt.n_uname) {
+#ifdef _WIN32
+        /* no uid on Windows: the server maps users of the guest */
+        opt.n_uname = 0;
+#else
         opt.n_uname = getuid();
+#endif
     }
 
     P9Req *req = v9fs_req_init(opt.client, 4 + 4 + 2 + 2 + 4, P9_TATTACH,

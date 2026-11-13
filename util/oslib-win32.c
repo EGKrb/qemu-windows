@@ -34,6 +34,7 @@
 #include "qemu/sockets.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/memfd.h"
 #include <malloc.h>
 
 static int get_allocation_granularity(void)
@@ -562,6 +563,8 @@ int qemu_close_wrap(int fd)
     int ret = -1;
 
     if (!fd_is_socket(fd)) {
+        /* what keeps the seals of a memfd sealed through @fd */
+        qemu_memfd_win32_close(fd);
         return close(fd);
     }
 
@@ -953,6 +956,11 @@ int qemu_ftruncate64(int fd, int64_t length)
     }
 
     h = (HANDLE)_get_osfhandle(fd);
+
+    /* seals of memfds (util/memfd-win32.c) */
+    if (qemu_memfd_win32_truncate_check(h, length) < 0) {
+        return -1;
+    }
 
     /* get current position, ftruncate do not change position */
     li.HighPart = 0;

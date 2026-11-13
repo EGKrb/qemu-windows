@@ -13,6 +13,11 @@
  */
 
 #include "qemu/osdep.h"
+#ifdef _WIN32
+#define P9_TEST_UID 0   /* no uid on Windows: see virtio-9p-client.c */
+#else
+#define P9_TEST_UID getuid()
+#endif
 #include "qemu/module.h"
 #include "libqos/virtio.h"
 #include "libqos/virtio-9p-client.h"
@@ -486,7 +491,7 @@ static void fs_walk_none(void *obj, void *data, QGuestAllocator *t_alloc)
 
     tversion({ .client = v9p });
     tattach({
-        .client = v9p, .fid = 0, .n_uname = getuid(),
+        .client = v9p, .fid = 0, .n_uname = P9_TEST_UID,
         .rattach.qid = &root_qid
     });
 
@@ -516,7 +521,7 @@ static void fs_walk_dotdot(void *obj, void *data, QGuestAllocator *t_alloc)
 
     tversion({ .client = v9p });
     tattach({
-        .client = v9p, .fid = 0, .n_uname = getuid(),
+        .client = v9p, .fid = 0, .n_uname = P9_TEST_UID,
         .rattach.qid = &root_qid
     });
 

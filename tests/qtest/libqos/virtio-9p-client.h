@@ -15,6 +15,9 @@
 #ifndef TESTS_LIBQOS_VIRTIO_9P_CLIENT_H
 #define TESTS_LIBQOS_VIRTIO_9P_CLIENT_H
 
+#ifdef _WIN32
+#define P9_WIN32_CLIENT
+#endif
 #include "hw/9pfs/9p.h"
 #include "hw/9pfs/9p-synth.h"
 #include "virtio-9p.h"

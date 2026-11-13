@@ -431,6 +431,14 @@ qio_channel_socket_accept(QIOChannelSocket *ioc,
         QIOChannel *ioc_local = QIO_CHANNEL(cioc);
         qio_channel_set_feature(ioc_local, QIO_CHANNEL_FEATURE_FD_PASS);
     }
+#else
+    /*
+     * A socket from accept() inherits the WSAEventSelect() of the listener,
+     * which makes it non-blocking: give it back as POSIX does, blocking and
+     * selected for nothing
+     */
+    qemu_socket_unselect_nofail(cioc->fd);
+    qemu_set_blocking(cioc->fd, true, NULL);
 #endif /* WIN32 */
 
     qio_channel_set_feature(QIO_CHANNEL(cioc),
@@ -769,6 +777,15 @@ static int w32fd_to_fd(W32FdItem *it)
     }
 }
 
+/*
+ * AF_UNIX of Windows reports a reset when the peer process ends (killed,
+ * or with data unread); Linux reads the end of the stream: so do we
+ */
+static bool qio_channel_socket_unix_eof(QIOChannelSocket *sioc)
+{
+    return errno == ECONNRESET && sioc->localAddr.ss_family == AF_UNIX;
+}
+
 static ssize_t qio_channel_socket_readv_handles(QIOChannelSocket *sioc,
                                                 const struct iovec *iov,
                                                 size_t niov,
@@ -786,6 +803,9 @@ static ssize_t qio_channel_socket_readv_handles(QIOChannelSocket *sioc,
     if (ret < 0) {
         if (errno == EAGAIN) {
             return QIO_CHANNEL_ERR_BLOCK;
+        }
+        if (qio_channel_socket_unix_eof(sioc)) {
+            return 0;
         }
         error_setg_errno(errp, errno, "Unable to read from socket");
         return -1;
@@ -870,6 +890,8 @@ static ssize_t qio_channel_socket_readv(QIOChannel *ioc,
                 }
             } else if (errno == EINTR) {
                 goto retry;
+            } else if (qio_channel_socket_unix_eof(sioc)) {
+                return done;
             } else {
                 error_setg_errno(errp, errno,
                                  "Unable to read from socket");

@@ -54,6 +54,10 @@ void virtio_9p_create_local_test_dir(void)
     }
 
     g_assert(local_test_path != NULL);
+#ifdef _WIN32
+    /* the path goes into regex replacements, where \ is an escape */
+    g_strdelimit(local_test_path, "\\", '/');
+#endif
 
     /* ensure test directory exists now ... */
     g_assert(stat(local_test_path, &st) == 0);
@@ -61,14 +65,42 @@ void virtio_9p_create_local_test_dir(void)
     g_assert((st.st_mode & S_IFMT) == S_IFDIR);
 }
 
+#ifdef _WIN32
+/* rm -fr: no shell with rm on Windows */
+static void remove_tree(const char *path)
+{
+    GDir *dir = g_dir_open(path, 0, NULL);
+    const char *name;
+
+    if (dir) {
+        while ((name = g_dir_read_name(dir))) {
+            g_autofree char *child = g_build_filename(path, name, NULL);
+
+            if (g_file_test(child, G_FILE_TEST_IS_DIR) &&
+                !g_file_test(child, G_FILE_TEST_IS_SYMLINK)) {
+                remove_tree(child);
+            } else {
+                g_remove(child);
+            }
+        }
+        g_dir_close(dir);
+    }
+    g_rmdir(path);
+}
+#endif
+
 void virtio_9p_remove_local_test_dir(void)
 {
     g_assert(local_test_path != NULL);
+#ifdef _WIN32
+    remove_tree(local_test_path);
+#else
     g_autofree char *cmd = g_strdup_printf("rm -fr '%s'\n", local_test_path);
     int res = system(cmd);
     if (res < 0) {
         /* ignore error, dummy check to prevent compiler error */
     }
+#endif
     g_free(local_test_path);
     local_test_path = NULL;
 }

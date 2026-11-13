@@ -57,6 +57,12 @@ struct p9_stat {
     struct timespec st_mtim;
     struct timespec st_ctim;
 };
+/*
+ * The 9p server sees files through struct p9_stat; a 9p client (the
+ * qtests) includes the headers for the protocol and keeps the stat() of
+ * the C runtime: it defines P9_WIN32_CLIENT
+ */
+#ifndef P9_WIN32_CLIENT
 #undef stat
 #undef fstat
 #undef lstat
@@ -66,6 +72,7 @@ struct p9_stat {
 #define st_atime st_atim.tv_sec
 #define st_mtime st_mtim.tv_sec
 #define st_ctime st_ctim.tv_sec
+#endif
 
 int p9_fstat(int fd, struct p9_stat *st);
 int p9_lstat(const char *path, struct p9_stat *st);

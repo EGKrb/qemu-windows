@@ -15,6 +15,7 @@
 
 #include "backends/tpm/tpm_ioctl.h"
 #include "io/channel-socket.h"
+#include "qemu/sockets.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qobject/qlist.h"
@@ -98,6 +99,10 @@ void *tpm_emu_ctrl_thread(void *data)
     QIOChannelSocket *lioc = qio_channel_socket_new();
     QIOChannel *ioc;
 
+#ifdef _WIN32
+    /* Winsock, before this socket */
+    socket_init();
+#endif
     qio_channel_socket_listen_sync(lioc, s->addr, 1, &error_abort);
 
     g_mutex_lock(&s->data_mutex);
@@ -108,6 +113,10 @@ void *tpm_emu_ctrl_thread(void *data)
     qio_channel_wait(QIO_CHANNEL(lioc), G_IO_IN);
     ioc = QIO_CHANNEL(qio_channel_socket_accept(lioc, &error_abort));
     g_assert(ioc);
+#ifdef _WIN32
+    /* CMD_SET_DATAFD: the socket comes in a frame (qemu/win32-fdpass.h) */
+    qio_channel_socket_set_handle_passing(QIO_CHANNEL_SOCKET(ioc));
+#endif
     qtest_add_abrt_handler(tpm_emu_close_ioc, ioc);
 
     {

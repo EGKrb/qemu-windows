@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/mmap-alloc.h"
+#include "qemu/memfd.h"
 
 size_t qemu_fd_getpagesize(int fd)
 {
@@ -80,6 +81,17 @@ void *qemu_ram_mmap(int fd,
      * exists (the size of the file is then 0 for "all of it").
      */
     max_size = (readonly || !shared) ? 0 : (uint64_t)map_offset + size;
+    if (!readonly && shared) {
+        /* sealed memfds: no shared writable view once write-sealed */
+        if (qemu_memfd_win32_map_check(file, PROT_READ | PROT_WRITE,
+                                       MAP_SHARED) < 0) {
+            return MAP_FAILED;
+        }
+        /* nor growth of a file sealed against it */
+        if (qemu_memfd_win32_truncate_check(file, max_size) < 0) {
+            max_size = 0;
+        }
+    }
     mapping = CreateFileMappingW(file, NULL, protect,
                                  (DWORD)(max_size >> 32), (DWORD)max_size,
                                  NULL);
@@ -119,12 +131,16 @@ void *qemu_ram_mmap(int fd,
         errno = ENOMEM;
         return MAP_FAILED;
     }
+    if (!readonly && shared) {
+        qemu_memfd_win32_mapped(file, ptr);
+    }
     return ptr;
 }
 
 void qemu_ram_munmap(int fd, void *ptr, size_t size)
 {
     if (ptr) {
+        qemu_memfd_win32_unmapped(ptr);
         UnmapViewOfFile(ptr);
     }
 }
@@ -144,6 +160,9 @@ void *qemu_win32_mmap(void *addr, size_t len, int prot, int flags, int fd,
     }
     if (file == INVALID_HANDLE_VALUE || offset % allocation_granularity()) {
         errno = EINVAL;
+        return MAP_FAILED;
+    }
+    if (qemu_memfd_win32_map_check(file, prot, flags) < 0) {
         return MAP_FAILED;
     }
     if (!(prot & PROT_WRITE)) {
@@ -170,10 +189,14 @@ void *qemu_win32_mmap(void *addr, size_t len, int prot, int flags, int fd,
         errno = ENOMEM;
         return MAP_FAILED;
     }
+    if ((prot & PROT_WRITE) && (flags & MAP_SHARED)) {
+        qemu_memfd_win32_mapped(file, ptr);
+    }
     return ptr;
 }
 
 int qemu_win32_munmap(void *addr, size_t len)
 {
+    qemu_memfd_win32_unmapped(addr);
     return UnmapViewOfFile(addr) ? 0 : -1;
 }

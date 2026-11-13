@@ -669,14 +669,39 @@ static bool data_handle(void)
         return false;
     }
     len = ((uint32_t)hdr[2] << 24) | (hdr[3] << 16) | (hdr[4] << 8) | hdr[5];
-    if (len < sizeof(hdr) || len > 64 * 1024) {
+    if (len < sizeof(hdr)) {
         return false;
     }
-    cmd = malloc(len);
-    memcpy(cmd, hdr, sizeof(hdr));
-    if (!recv_all(data, cmd + sizeof(hdr), len - sizeof(hdr))) {
-        free(cmd);
-        return false;
+    /*
+     * As swtpm: the command is what QEMU wrote, not what its header says.
+     * Take the bytes that came (waiting a little for the rest): a header
+     * that claims more makes libtpms answer TPM_RC_COMMAND_SIZE, instead
+     * of waiting here for bytes that never come.
+     */
+    {
+        uint32_t want = len > 64 * 1024 ? 64 * 1024 : len;
+        uint32_t got = sizeof(hdr);
+
+        cmd = malloc(want);
+        memcpy(cmd, hdr, sizeof(hdr));
+        while (got < want) {
+            WSAPOLLFD pfd = { .fd = data, .events = POLLRDNORM };
+            int n;
+
+            if (WSAPoll(&pfd, 1, 200) <= 0) {
+                break;
+            }
+            n = recv(data, (char *)cmd + got, (int)(want - got), 0);
+            if (n <= 0) {
+                if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
+                    continue;
+                }
+                free(cmd);
+                return false;
+            }
+            got += n;
+        }
+        len = got;
     }
     if (!tpm_running) {
         /* TPM_RC_FAILURE */
@@ -725,14 +750,19 @@ static const char *opt_value(const char *opts, const char *key)
     return NULL;
 }
 
-static void usage(void)
+static void usage_to(FILE *f, int code)
 {
-    fprintf(stderr,
+    fprintf(f,
             "usage: swtpm socket --tpm2 --tpmstate dir=DIR "
             "--ctrl type=unixio,path=SOCKET\n"
             "        [--log file=FILE,level=N] [--pid file=FILE] "
             "[--flags not-need-init[,startup-clear]] [--terminate]\n");
-    exit(2);
+    exit(code);
+}
+
+static void usage(void)
+{
+    usage_to(stderr, 2);
 }
 
 int main(int argc, char **argv)
@@ -754,7 +784,10 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         const char *o = i + 1 < argc ? argv[i + 1] : NULL;
 
-        if (!strcmp(a, "--tpm2")) {
+        if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
+            /* as swtpm: the usage on stdout (what qtests look for) */
+            usage_to(stdout, 0);
+        } else if (!strcmp(a, "--tpm2")) {
             continue;
         } else if (!strcmp(a, "--terminate")) {
             terminate_on_hangup = true;

@@ -20,13 +20,25 @@
 #include "libqos/qgraph.h"
 #include "libqos/vhost-user-blk.h"
 #include "libqos/libqos-pc.h"
+#ifdef _WIN32
+#include "qemu/sockets.h"
+#endif
 
 #define TEST_IMAGE_SIZE         (64 * 1024 * 1024)
 #define QVIRTIO_BLK_TIMEOUT_US  (30 * 1000 * 1000)
 #define PCI_SLOT_HP             0x06
 
 typedef struct {
+#ifdef _WIN32
+    /*
+     * Windows: no fork(), no listening socket to inherit, no SIGTERM;
+     * qemu-storage-daemon listens on paths and quits through its QMP
+     */
+    GPid pid;
+    char *qmp_path;
+#else
     pid_t pid;
+#endif
 } QemuStorageDaemonState;
 
 typedef struct QVirtioBlkReq {
@@ -854,8 +866,10 @@ static char *create_listen_socket(int *fd)
 static void quit_storage_daemon(void *data)
 {
     QemuStorageDaemonState *qsd = data;
+#ifndef _WIN32
     int wstatus;
     pid_t pid;
+#endif
 
     /*
      * If we were invoked as a g_test_queue_destroy() cleanup function we need
@@ -868,6 +882,30 @@ static void quit_storage_daemon(void *data)
     /* Before quitting storage-daemon, quit qemu to avoid dubious messages */
     qtest_kill_qemu(global_qtest);
 
+#ifdef _WIN32
+    {
+        static const char quit[] = "{\"execute\":\"qmp_capabilities\"}\n"
+                                   "{\"execute\":\"quit\"}\n";
+        DWORD code = 1;
+        int fd = unix_connect(qsd->qmp_path, NULL);
+
+        g_assert_cmpint(fd, >=, 0);
+        g_assert_cmpint(send(fd, quit, sizeof(quit) - 1, 0), ==,
+                        sizeof(quit) - 1);
+        g_assert_cmpint(WaitForSingleObject(qsd->pid, 60000), ==,
+                        WAIT_OBJECT_0);
+        GetExitCodeProcess(qsd->pid, &code);
+        close(fd);
+        g_spawn_close_pid(qsd->pid);
+        unlink(qsd->qmp_path);
+        g_free(qsd->qmp_path);
+        if (code != 0) {
+            fprintf(stderr, "%s: expected qemu-storage-daemon to exit "
+                    "successfully, got %lu\n", __func__, (unsigned long)code);
+            abort();
+        }
+    }
+#else
     kill(qsd->pid, SIGTERM);
     pid = waitpid(qsd->pid, &wstatus, 0);
     g_assert_cmpint(pid, ==, qsd->pid);
@@ -882,6 +920,7 @@ static void quit_storage_daemon(void *data)
                 __func__, WEXITSTATUS(wstatus));
         abort();
     }
+#endif
 
     g_free(data);
 }
@@ -895,13 +934,66 @@ static void start_vhost_user_blk(GString *cmd_line, int vus_instances,
     GString *storage_daemon_command = g_string_new(NULL);
     QemuStorageDaemonState *qsd;
 
+#ifdef _WIN32
+    g_string_append_printf(storage_daemon_command, "\"%s\" ",
+                           vhost_user_blk_bin);
+#else
     g_string_append_printf(storage_daemon_command,
                            "exec %s ",
                            vhost_user_blk_bin);
+#endif
 
     g_string_append_printf(cmd_line,
             " -object memory-backend-shm,id=mem,size=256M "
             " -M memory-backend=mem -m 256M ");
+
+#ifdef _WIN32
+    for (i = 0; i < vus_instances; i++) {
+        char *sock_path = g_strdup_printf("%s/qtest-%d-sock.%d",
+                                          g_get_tmp_dir(), getpid(), i);
+
+        unlink(sock_path);
+        g_test_queue_destroy(destroy_file, sock_path);
+        img_path = drive_create();
+        g_string_append_printf(storage_daemon_command,
+            "--blockdev driver=file,node-name=disk%d,filename=%s "
+            "--export type=vhost-user-blk,id=disk%d,addr.type=unix,"
+            "addr.path=%s,node-name=disk%i,writable=on,num-queues=%d ",
+            i, img_path, i, sock_path, i, num_queues);
+        g_string_append_printf(cmd_line, "-chardev socket,id=char%d,path=%s ",
+                               i + 1, sock_path);
+    }
+    qsd = g_new(QemuStorageDaemonState, 1);
+    qsd->qmp_path = g_strdup_printf("%s/qtest-%d-qsd-qmp", g_get_tmp_dir(),
+                                    getpid());
+    unlink(qsd->qmp_path);
+    g_string_append_printf(storage_daemon_command,
+                           "--chardev socket,id=qmp,path=%s,server=on,wait=off "
+                           "--monitor chardev=qmp", qsd->qmp_path);
+    g_test_message("starting vhost-user backend: %s",
+                   storage_daemon_command->str);
+    {
+        g_auto(GStrv) argv = NULL;
+        int j;
+
+        /* the shell syntax of the parser takes \ for an escape */
+        g_strdelimit(storage_daemon_command->str, "\\", '/');
+        g_assert_true(g_shell_parse_argv(storage_daemon_command->str, NULL,
+                                         &argv, NULL));
+        g_assert_true(g_spawn_async(NULL, argv, NULL,
+                                    G_SPAWN_DO_NOT_REAP_CHILD |
+                                    G_SPAWN_STDOUT_TO_DEV_NULL,
+                                    NULL, NULL, &qsd->pid, NULL));
+        /* QEMU connects once the daemon listens */
+        for (j = 0; j < 1000 && !g_file_test(qsd->qmp_path,
+                                             G_FILE_TEST_EXISTS); j++) {
+            g_usleep(10000);
+        }
+    }
+    g_string_free(storage_daemon_command, true);
+    qtest_add_abrt_handler(quit_storage_daemon, qsd);
+    g_test_queue_destroy(quit_storage_daemon, qsd);
+#else
 
     for (i = 0; i < vus_instances; i++) {
         int fd;
@@ -943,6 +1035,7 @@ static void start_vhost_user_blk(GString *cmd_line, int vus_instances,
     /* Make sure qemu-storage-daemon is stopped */
     qtest_add_abrt_handler(quit_storage_daemon, qsd);
     g_test_queue_destroy(quit_storage_daemon, qsd);
+#endif
 }
 
 static void *vhost_user_blk_test_setup(GString *cmd_line, void *arg)

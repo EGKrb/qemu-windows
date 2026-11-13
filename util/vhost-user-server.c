@@ -258,6 +258,15 @@ static coroutine_fn void vu_client_trip(void *opaque)
     /* vu_deinit() should have called remove_watch() */
     assert(QTAILQ_EMPTY(&server->vu_fd_watches));
 
+#ifdef _WIN32
+    /*
+     * vu_deinit() closed the socket (dev->sock): the channel must not close
+     * it again (on Windows that warns, and a reused descriptor number
+     * would close another file)
+     */
+    server->sioc->fd = -1;
+#endif
+
     object_unref(OBJECT(server->sioc));
     server->sioc = NULL;
 
