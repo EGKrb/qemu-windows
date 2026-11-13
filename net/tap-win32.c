@@ -893,6 +893,8 @@ static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
         goto out;
     }
     CloseHandle(pi.hThread);
+    /* the helper has its copy: no other program we start gets one */
+    SetHandleInformation(child_sock, HANDLE_FLAG_INHERIT, 0);
     /*
      * our copy of the end of the helper stays open until its frame came:
      * closing it while the helper starts may cut the connection; the end
@@ -948,13 +950,23 @@ static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
     }
     if (n <= 0 || !ret) {
         DWORD code = 0;
+        int err = errno;
 
-        WaitForSingleObject(pi.hProcess, 10000);
+        /*
+         * Our ends closed, the helper sees QEMU gone: it takes its adapter
+         * out of the bridge and removes it
+         */
+        close(sv[0]);
+        sv[0] = -1;
+        close(sv[1]);
+        sv[1] = -1;
+        WaitForSingleObject(pi.hProcess, 30000);
         GetExitCodeProcess(pi.hProcess, &code);
         if (code == STILL_ACTIVE) {
             TerminateProcess(pi.hProcess, 1);
-            error_setg(errp, "bridge helper sent no handle (%s)",
-                       n < 0 ? strerror(errno) : "end of stream");
+            error_setg(errp, "bridge helper sent no handle (read %zd, "
+                       "%d handles%s%s)", n, nitems, n < 0 ? ": " : "",
+                       n < 0 ? strerror(err) : "");
         } else {
             error_setg(errp, "bridge helper failed (exit code %lu)",
                        (unsigned long)code);

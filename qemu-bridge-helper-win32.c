@@ -48,6 +48,27 @@ typedef struct ACLRule {
 
 typedef QSIMPLEQ_HEAD(ACLList, ACLRule) ACLList;
 
+/* QEMU_BRIDGE_HELPER_DEBUG=1: the steps on stderr, with times */
+static void dbg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+static void dbg(const char *fmt, ...)
+{
+    static int on = -1;
+    va_list ap;
+
+    if (on < 0) {
+        on = getenv("QEMU_BRIDGE_HELPER_DEBUG") != NULL;
+    }
+    if (!on) {
+        return;
+    }
+    fprintf(stderr, "bridge-helper %lu %llu ms: ", GetCurrentProcessId(),
+            (unsigned long long)GetTickCount64());
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -182,6 +203,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     sock = (SOCKET)sock_arg;
+    /*
+     * Ours only: the programs we start (netsh) must not inherit it, or
+     * their end may end the stream for QEMU
+     */
+    SetHandleInformation((HANDLE)sock, HANDLE_FLAG_INHERIT, 0);
 
     /* the ACL: deny wins over allow, the default is to deny */
     QSIMPLEQ_INIT(&acl_list);
@@ -235,17 +261,22 @@ int main(int argc, char **argv)
     }
 
     /* a new TAP adapter, in the bridge */
+    dbg("start: bridge %s, socket %llu", bridge, sock_arg);
     guid = tap_win32_adapter_create(NULL, &ifname, &err);
+    dbg("adapter %s %s", guid ? ifname : "(failed)", guid ? guid : "");
     if (!guid) {
         error_report_err(err);
         goto cleanup;
     }
     if (!tap_win32_bridge_add(bridge, ifname, &err)) {
+        dbg("bridge add failed");
         error_report_err(err);
         goto cleanup;
     }
     bridged = true;
+    dbg("bridged");
     tap = tap_win32_adapter_open(guid, &err);
+    dbg("opened: %p", tap);
     if (!tap) {
         error_report_err(err);
         goto cleanup;
@@ -254,13 +285,22 @@ int main(int argc, char **argv)
     /* the handle to QEMU */
     item.type = W32FD_HANDLE;
     item.handle = tap;
+    {
+        char c;
+        int peek = recv(sock, &c, 1, MSG_PEEK);
+
+        dbg("socket before send: peek %d, error %d", peek,
+            peek < 0 ? WSAGetLastError() : 0);
+    }
     if (w32fd_send(sock, &st, &iov, 1, &item, 1) != 1) {
+        dbg("send failed: errno %d, wsa %d", errno, WSAGetLastError());
         fprintf(stderr, "failed to write fd to unix socket: %s\n",
                 strerror(errno));
         CloseHandle(tap);
         goto cleanup;
     }
     CloseHandle(tap);
+    dbg("sent the handle");
 
     /*
      * Until QEMU is gone: its process ends, or its end of the socket closes
@@ -299,9 +339,11 @@ int main(int argc, char **argv)
         }
         WSACloseEvent(ev);
     }
+    dbg("QEMU gone");
     ret = EXIT_SUCCESS;
 
 cleanup:
+    dbg("cleanup");
     if (bridged && !tap_win32_bridge_remove(bridge, ifname, &err)) {
         error_report_err(err);
         err = NULL;
