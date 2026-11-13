@@ -296,6 +296,8 @@ struct ChardevClass {
 
     /* set ancillary fds to be sent with next write */
     int (*chr_set_msgfds)(Chardev *s, int *fds, int num);
+    /* Windows: both ends frame the stream to pass handles */
+    void (*chr_set_handle_passing)(Chardev *s);
 
     /* accept the given fd */
     int (*chr_add_client)(Chardev *chr, int fd);

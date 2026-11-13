@@ -1159,13 +1159,13 @@ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
     memset(&addr, 0, sizeof(struct vhost_vring_addr));
 
     if (phys || vhost_dev_has_iommu(dev)) {
-        addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc_phys;
-        addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail_phys;
-        addr.used_user_addr = (uint64_t)(unsigned long)vq->used_phys;
+        addr.desc_user_addr = (uint64_t)(uintptr_t)vq->desc_phys;
+        addr.avail_user_addr = (uint64_t)(uintptr_t)vq->avail_phys;
+        addr.used_user_addr = (uint64_t)(uintptr_t)vq->used_phys;
     } else {
-        addr.desc_user_addr = (uint64_t)(unsigned long)vq->desc_user;
-        addr.avail_user_addr = (uint64_t)(unsigned long)vq->avail_user;
-        addr.used_user_addr = (uint64_t)(unsigned long)vq->used_user;
+        addr.desc_user_addr = (uint64_t)(uintptr_t)vq->desc_user;
+        addr.avail_user_addr = (uint64_t)(uintptr_t)vq->avail_user;
+        addr.used_user_addr = (uint64_t)(uintptr_t)vq->used_user;
     }
     addr.index = idx;
     addr.log_guest_addr = vq->used_phys;
@@ -2560,6 +2560,21 @@ int vhost_check_device_state(struct vhost_dev *dev, Error **errp)
     return -ENOSYS;
 }
 
+/* The pipe of the transfer of a back-end's state */
+static bool qemu_vhost_pipe(int fds[2], GError **err)
+{
+#ifdef _WIN32
+    if (_pipe(fds, 1024 * 1024, _O_BINARY) < 0) {
+        g_set_error(err, G_FILE_ERROR, g_file_error_from_errno(errno),
+                    "%s", strerror(errno));
+        return false;
+    }
+    return true;
+#else
+    return g_unix_open_pipe(fds, FD_CLOEXEC, err);
+#endif
+}
+
 int vhost_save_backend_state(struct vhost_dev *dev, QEMUFile *f, Error **errp)
 {
     ERRP_GUARD();
@@ -2571,7 +2586,7 @@ int vhost_save_backend_state(struct vhost_dev *dev, QEMUFile *f, Error **errp)
     int ret;
 
     /* [0] for reading (our end), [1] for writing (back-end's end) */
-    if (!g_unix_open_pipe(pipe_fds, FD_CLOEXEC, &g_err)) {
+    if (!qemu_vhost_pipe(pipe_fds, &g_err)) {
         error_setg(errp, "Failed to set up state transfer pipe: %s",
                    g_err->message);
         ret = -EINVAL;
@@ -2663,7 +2678,7 @@ int vhost_load_backend_state(struct vhost_dev *dev, QEMUFile *f, Error **errp)
     int ret;
 
     /* [0] for reading (back-end's end), [1] for writing (our end) */
-    if (!g_unix_open_pipe(pipe_fds, FD_CLOEXEC, &g_err)) {
+    if (!qemu_vhost_pipe(pipe_fds, &g_err)) {
         error_setg(errp, "Failed to set up state transfer pipe: %s",
                    g_err->message);
         ret = -EINVAL;

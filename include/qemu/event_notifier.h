@@ -42,6 +42,14 @@ int event_notifier_get_wfd(const EventNotifier *);
 bool event_notifier_initialized(const EventNotifier *e);
 #else
 HANDLE event_notifier_get_handle(EventNotifier *);
+/*
+ * The descriptors of event notifiers on Windows are handle tokens
+ * (qemu/win32-fdpass.h): what vhost-user passes to its back-ends
+ */
+void event_notifier_init_fd(EventNotifier *, int fd);
+int event_notifier_get_fd(const EventNotifier *);
+int event_notifier_get_wfd(const EventNotifier *);
+bool event_notifier_initialized(const EventNotifier *e);
 #endif
 
 #endif

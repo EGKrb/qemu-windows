@@ -22,6 +22,9 @@
 typedef struct VuFdWatch {
     VuDev *vu_dev;
     int fd; /*kick fd*/
+#ifdef _WIN32
+    EventNotifier notifier; /* the event of the kick "fd" */
+#endif
     void *pvt;
     vu_watch_cb cb;
     QTAILQ_ENTRY(VuFdWatch) next;

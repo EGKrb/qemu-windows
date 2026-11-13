@@ -106,6 +106,26 @@ void os_setup_early_signal_handling(void);
 
 int getpagesize(void);
 
+/*
+ * mmap() of a file (a descriptor of the C runtime, or a handle token of
+ * qemu/win32-fdpass.h): a view of a file mapping; munmap() unmaps the
+ * whole view.  The offset is a multiple of 64 KiB.
+ */
+#define PROT_NONE  0x0
+#define PROT_READ  0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC  0x4
+#define MAP_SHARED  0x01
+#define MAP_PRIVATE 0x02
+#ifndef MAP_FAILED
+#define MAP_FAILED ((void *) -1)
+#endif
+void *qemu_win32_mmap(void *addr, size_t len, int prot, int flags, int fd,
+                      int64_t offset);
+int qemu_win32_munmap(void *addr, size_t len);
+#define mmap qemu_win32_mmap
+#define munmap qemu_win32_munmap
+
 #if !defined(EPROTONOSUPPORT)
 # define EPROTONOSUPPORT EINVAL
 #endif

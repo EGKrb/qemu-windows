@@ -8,6 +8,9 @@
  * later.  See the COPYING file in the top-level directory.
  */
 #include "qemu/osdep.h"
+#ifdef _WIN32
+#include "qemu/win32-fdpass.h"
+#endif
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/vhost-user-server.h"
@@ -58,6 +61,12 @@ static void vmsg_close_fds(VhostUserMsg *vmsg)
 {
     int i;
     for (i = 0; i < vmsg->fd_num; i++) {
+#ifdef _WIN32
+        if (w32fd_is_token(vmsg->fds[i])) {
+            CloseHandle(w32fd_token_handle(vmsg->fds[i]));
+            continue;
+        }
+#endif
         close(vmsg->fds[i]);
     }
 }
@@ -78,6 +87,12 @@ static bool vmsg_unblock_fds(VhostUserMsg *vmsg, Error **errp)
     }
 
     for (i = 0; i < vmsg->fd_num; i++) {
+#ifdef _WIN32
+        /* events and files: nothing to unblock */
+        if (w32fd_is_token(vmsg->fds[i]) || !fd_is_socket(vmsg->fds[i])) {
+            continue;
+        }
+#endif
         if (!qemu_set_blocking(vmsg->fds[i], false, errp)) {
             return false;
         }
@@ -278,6 +293,28 @@ static void kick_handler(void *opaque)
     }
 }
 
+#ifdef _WIN32
+/* Windows: kick "fds" are handle tokens of events */
+static void kick_notifier_handler(EventNotifier *e)
+{
+    VuFdWatch *vu_fd_watch = container_of(e, VuFdWatch, notifier);
+
+    kick_handler(vu_fd_watch);
+}
+#endif
+
+static void watch_set_handler(AioContext *ctx, VuFdWatch *vu_fd_watch,
+                              bool on)
+{
+#ifdef _WIN32
+    aio_set_event_notifier(ctx, &vu_fd_watch->notifier,
+                           on ? kick_notifier_handler : NULL, NULL, NULL);
+#else
+    aio_set_fd_handler(ctx, vu_fd_watch->fd, on ? kick_handler : NULL,
+                       NULL, NULL, NULL, on ? vu_fd_watch : NULL);
+#endif
+}
+
 static VuFdWatch *find_vu_fd_watch(VuServer *server, int fd)
 {
 
@@ -297,7 +334,9 @@ set_watch(VuDev *vu_dev, int fd, int vu_evt,
 
     VuServer *server = container_of(vu_dev, VuServer, vu_dev);
     g_assert(vu_dev);
+#ifndef _WIN32
     g_assert(fd >= 0);
+#endif
     g_assert(cb);
 
     VuFdWatch *vu_fd_watch = find_vu_fd_watch(server, fd);
@@ -309,10 +348,13 @@ set_watch(VuDev *vu_dev, int fd, int vu_evt,
 
         vu_fd_watch->fd = fd;
         vu_fd_watch->cb = cb;
+#ifdef _WIN32
+        event_notifier_init_fd(&vu_fd_watch->notifier, fd);
+#else
         /* TODO: handle error more gracefully than aborting */
         qemu_set_blocking(fd, false, &error_abort);
-        aio_set_fd_handler(server->ctx, fd, kick_handler,
-                           NULL, NULL, NULL, vu_fd_watch);
+#endif
+        watch_set_handler(server->ctx, vu_fd_watch, true);
         vu_fd_watch->vu_dev = vu_dev;
         vu_fd_watch->pvt = pvt;
     }
@@ -323,7 +365,9 @@ static void remove_watch(VuDev *vu_dev, int fd)
 {
     VuServer *server;
     g_assert(vu_dev);
+#ifndef _WIN32
     g_assert(fd >= 0);
+#endif
 
     server = container_of(vu_dev, VuServer, vu_dev);
 
@@ -332,7 +376,7 @@ static void remove_watch(VuDev *vu_dev, int fd)
     if (!vu_fd_watch) {
         return;
     }
-    aio_set_fd_handler(server->ctx, fd, NULL, NULL, NULL, NULL, NULL);
+    watch_set_handler(server->ctx, vu_fd_watch, false);
 
     QTAILQ_REMOVE(&server->vu_fd_watches, vu_fd_watch, next);
     g_free(vu_fd_watch);
@@ -351,6 +395,9 @@ static void vu_accept(QIONetListener *listener, QIOChannelSocket *sioc,
         return;
     }
 
+#ifdef _WIN32
+    qio_channel_socket_set_handle_passing(sioc);
+#endif
     if (!vu_init(&server->vu_dev, server->max_queues, sioc->fd, panic_cb,
                  vu_message_read, set_watch, remove_watch, server->vu_iface)) {
         error_report("Failed to initialize libvhost-user");
@@ -397,8 +444,7 @@ void vhost_user_server_stop(VuServer *server)
         VuFdWatch *vu_fd_watch;
 
         QTAILQ_FOREACH(vu_fd_watch, &server->vu_fd_watches, next) {
-            aio_set_fd_handler(server->ctx, vu_fd_watch->fd,
-                               NULL, NULL, NULL, NULL, vu_fd_watch);
+            watch_set_handler(server->ctx, vu_fd_watch, false);
         }
 
         qio_channel_shutdown(server->ioc, QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
@@ -436,8 +482,7 @@ void vhost_user_server_attach_aio_context(VuServer *server, AioContext *ctx)
     }
 
     QTAILQ_FOREACH(vu_fd_watch, &server->vu_fd_watches, next) {
-        aio_set_fd_handler(ctx, vu_fd_watch->fd, kick_handler, NULL,
-                           NULL, NULL, vu_fd_watch);
+        watch_set_handler(ctx, vu_fd_watch, true);
     }
 
     if (server->co_trip) {
@@ -468,8 +513,7 @@ void vhost_user_server_detach_aio_context(VuServer *server)
         VuFdWatch *vu_fd_watch;
 
         QTAILQ_FOREACH(vu_fd_watch, &server->vu_fd_watches, next) {
-            aio_set_fd_handler(server->ctx, vu_fd_watch->fd,
-                               NULL, NULL, NULL, NULL, vu_fd_watch);
+            watch_set_handler(server->ctx, vu_fd_watch, false);
         }
     }
 

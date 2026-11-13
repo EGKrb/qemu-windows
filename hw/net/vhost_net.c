@@ -25,15 +25,22 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#endif
 
 
 #include "standard-headers/linux/virtio_ring.h"
 #include "hw/virtio/vhost.h"
 #include "hw/virtio/virtio-bus.h"
+#ifdef _WIN32
+#include "standard-headers/linux/vhost_types.h"
+#define VHOST_FILE_UNBIND -1
+#else
 #include "linux-headers/linux/vhost.h"
+#endif
 
 void vhost_net_get_features_ex(struct vhost_net *net, uint64_t *features)
 {

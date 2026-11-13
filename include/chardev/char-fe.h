@@ -331,4 +331,13 @@ int qemu_chr_fe_get_msgfds(CharFrontend *c, int *fds, int num);
  */
 int qemu_chr_fe_set_msgfds(CharFrontend *c, int *fds, int num);
 
+/**
+ * qemu_chr_fe_set_handle_passing:
+ *
+ * Windows has no SCM_RIGHTS: a front end that passes descriptors (vhost-user)
+ * calls this before anything is sent, and the backend frames the stream to
+ * pass handles, from the first byte of each connection.  A no-op elsewhere.
+ */
+void qemu_chr_fe_set_handle_passing(CharFrontend *c);
+
 #endif /* QEMU_CHAR_FE_H */

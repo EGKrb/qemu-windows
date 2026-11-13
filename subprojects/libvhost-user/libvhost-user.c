@@ -27,10 +27,14 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include "win32-compat.h"
+#else
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <endian.h>
+#endif
 
 /* Necessary to provide VIRTIO_F_VERSION_1 on system
  * with older linux headers. Must appear before
@@ -94,7 +98,7 @@
 
 /* The version of the protocol we support */
 #define VHOST_USER_VERSION 1
-#define LIBVHOST_USER_DEBUG 0
+#define LIBVHOST_USER_DEBUG (getenv("LIBVHOST_USER_DEBUG") != NULL)
 
 #define DPRINT(...)                             \
     do {                                        \
@@ -533,6 +537,173 @@ have_userfault(void)
 #endif
 }
 
+#ifdef _WIN32
+/*
+ * Windows: messages and their descriptors are framed (win32-fdpass.h);
+ * the state of each connection is kept by its descriptor
+ */
+static struct {
+    int fd;
+    W32FdState st;
+} vu_w32_conns[16];
+
+static W32FdState *vu_w32_state(int fd)
+{
+    int i, free_slot = -1;
+
+    for (i = 0; i < 16; i++) {
+        if (vu_w32_conns[i].fd == fd + 1) {
+            return &vu_w32_conns[i].st;
+        }
+        if (!vu_w32_conns[i].fd && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot < 0) {
+        free_slot = 0;
+        w32fd_state_free(&vu_w32_conns[0].st);
+    }
+    memset(&vu_w32_conns[free_slot], 0, sizeof(vu_w32_conns[free_slot]));
+    vu_w32_conns[free_slot].fd = fd + 1;
+    return &vu_w32_conns[free_slot].st;
+}
+
+static SOCKET vu_w32_socket(int fd)
+{
+    intptr_t h = _get_osfhandle(fd);
+
+    return h == -1 ? (SOCKET)fd : (SOCKET)h;
+}
+
+static bool vu_w32_is_socket(HANDLE h)
+{
+    int type;
+    int len = sizeof(type);
+
+    return getsockopt((SOCKET)h, SOL_SOCKET, SO_TYPE, (char *)&type,
+                      &len) == 0;
+}
+
+static int vu_w32_item_fd(W32FdItem *it)
+{
+    int fd;
+
+    if (it->type == W32FD_HANDLE) {
+        return w32fd_handle_token(it->handle);
+    }
+    fd = _open_osfhandle((intptr_t)it->handle,
+                         it->type == W32FD_SOCKET ? _O_BINARY :
+                         _O_RDWR | _O_BINARY);
+    if (fd < 0) {
+        return w32fd_handle_token(it->handle);
+    }
+    return fd;
+}
+
+static bool
+vu_message_read_default(VuDev *dev, int conn_fd, VhostUserMsg *vmsg)
+{
+    W32FdItem items[W32FD_MAX_ITEMS];
+    W32FdState *st = vu_w32_state(conn_fd);
+    struct iovec iov = {
+        .iov_base = (char *)vmsg,
+        .iov_len = VHOST_USER_HDR_SIZE,
+    };
+    int nitems = 0, i;
+    ssize_t rc;
+
+    rc = w32fd_recv(vu_w32_socket(conn_fd), st, &iov, 1, items, &nitems,
+                    W32FD_MAX_ITEMS, false);
+    if (rc < 0) {
+        vu_panic(dev, "Error while recvmsg: %s", strerror(errno));
+        return false;
+    }
+    vmsg->fd_num = 0;
+    for (i = 0; i < nitems; i++) {
+        int fd = vu_w32_item_fd(&items[i]);
+
+        if (vmsg->fd_num < VHOST_MEMORY_BASELINE_NREGIONS) {
+            vmsg->fds[vmsg->fd_num++] = fd;
+        } else {
+            close(fd);
+        }
+    }
+    if (rc < VHOST_USER_HDR_SIZE) {
+        /* the rest of the header */
+        iov.iov_base = (char *)vmsg + rc;
+        iov.iov_len = VHOST_USER_HDR_SIZE - rc;
+        if (w32fd_recv(vu_w32_socket(conn_fd), st, &iov, 1, NULL, NULL, 0,
+                       false) != (ssize_t)iov.iov_len) {
+            vu_panic(dev, "Error while reading: %s", strerror(errno));
+            goto fail;
+        }
+    }
+
+    if (vmsg->size > sizeof(vmsg->payload)) {
+        vu_panic(dev,
+                 "Error: too big message request: %d, size: vmsg->size: %u, "
+                 "while sizeof(vmsg->payload) = %zu\n",
+                 vmsg->request, vmsg->size, sizeof(vmsg->payload));
+        goto fail;
+    }
+
+    if (vmsg->size) {
+        size_t got = 0;
+
+        while (got < vmsg->size) {
+            iov.iov_base = (char *)&vmsg->payload + got;
+            iov.iov_len = vmsg->size - got;
+            rc = w32fd_recv(vu_w32_socket(conn_fd), st, &iov, 1, NULL, NULL,
+                            0, false);
+            if (rc <= 0) {
+                vu_panic(dev, "Error while reading: %s", strerror(errno));
+                goto fail;
+            }
+            got += rc;
+        }
+    }
+
+    return true;
+
+fail:
+    vmsg_close_fds(vmsg);
+
+    return false;
+}
+
+static bool
+vu_message_write(VuDev *dev, int conn_fd, VhostUserMsg *vmsg)
+{
+    W32FdItem items[VHOST_MEMORY_BASELINE_NREGIONS];
+    struct iovec iov[2] = {
+        { .iov_base = (char *)vmsg, .iov_len = VHOST_USER_HDR_SIZE },
+        { .iov_base = vmsg->data ? (void *)vmsg->data :
+                      (char *)vmsg + VHOST_USER_HDR_SIZE,
+          .iov_len = vmsg->size },
+    };
+    int i;
+
+    assert(vmsg->fd_num <= VHOST_MEMORY_BASELINE_NREGIONS);
+    for (i = 0; i < vmsg->fd_num; i++) {
+        int fd = vmsg->fds[i];
+
+        if (w32fd_is_token(fd)) {
+            items[i].type = W32FD_HANDLE;
+            items[i].handle = w32fd_token_handle(fd);
+        } else {
+            items[i].handle = (HANDLE)_get_osfhandle(fd);
+            items[i].type = vu_w32_is_socket(items[i].handle) ?
+                            W32FD_SOCKET : W32FD_FILE;
+        }
+    }
+    if (w32fd_send(vu_w32_socket(conn_fd), vu_w32_state(conn_fd), iov,
+                   vmsg->size ? 2 : 1, items, vmsg->fd_num) < 0) {
+        vu_panic(dev, "Error while writing: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+#else
 static bool
 vu_message_read_default(VuDev *dev, int conn_fd, VhostUserMsg *vmsg)
 {
@@ -661,6 +832,7 @@ vu_message_write(VuDev *dev, int conn_fd, VhostUserMsg *vmsg)
 
     return true;
 }
+#endif
 
 static bool
 vu_send_reply(VuDev *dev, int conn_fd, VhostUserMsg *vmsg)

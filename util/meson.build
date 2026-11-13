@@ -24,6 +24,8 @@ else
   util_ss.add(files('event_notifier-win32.c'))
   util_ss.add(files('oslib-win32.c'))
   util_ss.add(files('mmap-alloc-win32.c'))
+  util_ss.add(files('win32-fdpass.c'))
+  util_ss.add(files('memfd-win32.c'))
   util_ss.add(files('qemu-thread-win32.c'))
   util_ss.add(winmm, pathcch, synchronization)
 endif
@@ -104,6 +106,9 @@ if have_block
     util_ss.add(files('filemonitor-inotify.c'), inotify)
   else
     util_ss.add(files('filemonitor-stub.c'))
+  endif
+  if host_os == 'windows' and vhost_user.found()
+    util_ss.add(files('vhost-user-server.c'), vhost_user)
   endif
   if host_os == 'linux'
     util_ss.add(files('vhost-user-server.c'), vhost_user)

@@ -887,6 +887,22 @@ static void tcp_chr_set_client_ioc_name(Chardev *chr,
 
 }
 
+#ifdef WIN32
+static void tcp_chr_set_handle_passing(Chardev *chr)
+{
+    SocketChardev *s = SOCKET_CHARDEV(chr);
+
+    if (s->addr && s->addr->type != SOCKET_ADDRESS_TYPE_UNIX &&
+        s->addr->type != SOCKET_ADDRESS_TYPE_FD) {
+        return;
+    }
+    s->handle_passing = true;
+    if (s->sioc) {
+        qio_channel_socket_set_handle_passing(s->sioc);
+    }
+}
+#endif
+
 static int tcp_chr_new_client(Chardev *chr, QIOChannelSocket *sioc)
 {
     SocketChardev *s = SOCKET_CHARDEV(chr);
@@ -901,6 +917,11 @@ static int tcp_chr_new_client(Chardev *chr, QIOChannelSocket *sioc)
         return -1;
     }
 
+#ifdef WIN32
+    if (s->handle_passing) {
+        qio_channel_socket_set_handle_passing(sioc);
+    }
+#endif
     s->ioc = QIO_CHANNEL(sioc);
     object_ref(OBJECT(sioc));
     s->sioc = sioc;
@@ -1563,6 +1584,9 @@ static void char_socket_class_init(ObjectClass *oc, const void *data)
     cc->chr_disconnect = tcp_chr_disconnect;
     cc->chr_get_msgfds = tcp_chr_get_msgfds;
     cc->chr_set_msgfds = tcp_chr_set_msgfds;
+#ifdef WIN32
+    cc->chr_set_handle_passing = tcp_chr_set_handle_passing;
+#endif
     cc->chr_add_client = tcp_chr_add_client;
     cc->chr_add_watch = tcp_chr_add_watch;
     cc->chr_update_read_handler = tcp_chr_update_read_handler;

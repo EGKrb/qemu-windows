@@ -228,9 +228,7 @@ have_tpm = get_option('tpm') \
 
 # vhost
 have_vhost_user = get_option('vhost_user') \
-  .disable_auto_if(host_os != 'linux') \
-  .require(host_os != 'windows',
-           error_message: 'vhost-user is not available on Windows').allowed()
+  .disable_auto_if(host_os not in ['linux', 'windows']).allowed()
 have_vhost_vdpa = get_option('vhost_vdpa') \
   .require(host_os == 'linux',
            error_message: 'vhost-vdpa is only available on Linux').allowed()
@@ -2178,8 +2176,8 @@ osdep_prefix = '''
 '''
 
 have_vhost_user_blk_server = get_option('vhost_user_blk_server') \
-  .require(host_os == 'linux',
-           error_message: 'vhost_user_blk_server requires linux') \
+  .require(host_os in ['linux', 'windows'],
+           error_message: 'vhost_user_blk_server requires linux or windows') \
   .require(have_vhost_user,
            error_message: 'vhost_user_blk_server requires vhost-user support') \
   .disable_auto_if(not have_tools and not have_system) \
@@ -3292,6 +3290,7 @@ host_kconfig = \
   (have_vhost_kernel ? ['CONFIG_VHOST_KERNEL=y'] : []) + \
   (have_virtfs ? ['CONFIG_VIRTFS=y'] : []) + \
   (host_os == 'linux' ? ['CONFIG_LINUX=y'] : []) + \
+  (host_os == 'windows' ? ['CONFIG_WIN32=y'] : []) + \
   (multiprocess_allowed ? ['CONFIG_MULTIPROCESS_ALLOWED=y'] : []) + \
   (vfio_user_server_allowed ? ['CONFIG_VFIO_USER_SERVER_ALLOWED=y'] : []) + \
   (hv_balloon ? ['CONFIG_HV_BALLOON_POSSIBLE=y'] : []) + \
@@ -3482,7 +3481,7 @@ if have_system and vfio_user_server_allowed
 endif
 
 vhost_user = not_found
-if host_os == 'linux' and have_vhost_user
+if host_os in ['linux', 'windows'] and have_vhost_user
   libvhost_user = subproject('libvhost-user')
   vhost_user = libvhost_user.get_variable('vhost_user_dep')
 endif

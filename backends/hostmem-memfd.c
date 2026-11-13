@@ -20,7 +20,9 @@
 #include "qom/object.h"
 #include "migration/cpr.h"
 #include "system/kvm.h"
+#ifdef CONFIG_LINUX
 #include <linux/kvm.h>
+#endif
 #include "qapi/qapi-type-infos-common.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(HostMemoryBackendMemfd, MEMORY_BACKEND_MEMFD)
@@ -71,10 +73,15 @@ memfd_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
             return false;
         }
 
+#ifdef CONFIG_LINUX
         fd = kvm_create_guest_memfd(backend->size,
                                     GUEST_MEMFD_FLAG_MMAP |
                                     GUEST_MEMFD_FLAG_INIT_SHARED,
                                     errp);
+#else
+        error_setg(errp, "guest-memfd=on needs KVM");
+        return false;
+#endif
     } else {
         fd = qemu_memfd_create(TYPE_MEMORY_BACKEND_MEMFD, backend->size,
                                m->hugetlb, m->hugetlbsize, m->seal ?

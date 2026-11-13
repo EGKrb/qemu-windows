@@ -160,6 +160,15 @@ void qemu_chr_fe_accept_input(CharFrontend *c)
     qemu_notify_event();
 }
 
+void qemu_chr_fe_set_handle_passing(CharFrontend *c)
+{
+    Chardev *s = c->chr;
+
+    if (s && CHARDEV_GET_CLASS(s)->chr_set_handle_passing) {
+        CHARDEV_GET_CLASS(s)->chr_set_handle_passing(s);
+    }
+}
+
 void qemu_chr_fe_printf(CharFrontend *c, const char *fmt, ...)
 {
     char buf[CHR_READ_BUF_LEN];

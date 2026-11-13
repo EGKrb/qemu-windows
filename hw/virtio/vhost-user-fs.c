@@ -12,7 +12,9 @@
  */
 
 #include "qemu/osdep.h"
+#ifndef _WIN32
 #include <sys/ioctl.h>
+#endif
 #include "standard-headers/linux/virtio_fs.h"
 #include "qapi/error.h"
 #include "hw/core/qdev-properties.h"

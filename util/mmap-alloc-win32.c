@@ -128,3 +128,52 @@ void qemu_ram_munmap(int fd, void *ptr, size_t size)
         UnmapViewOfFile(ptr);
     }
 }
+
+/* The mmap() of os-win32.h */
+void *qemu_win32_mmap(void *addr, size_t len, int prot, int flags, int fd,
+                      int64_t offset)
+{
+    HANDLE file, mapping;
+    DWORD protect, access;
+    void *ptr;
+
+    if (fd <= -2) {
+        file = (HANDLE)(uintptr_t)((uintptr_t)(-2 - fd) << 2);
+    } else {
+        file = (HANDLE)_get_osfhandle(fd);
+    }
+    if (file == INVALID_HANDLE_VALUE || offset % allocation_granularity()) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    if (!(prot & PROT_WRITE)) {
+        protect = PAGE_READONLY;
+        access = FILE_MAP_READ;
+    } else if (flags & MAP_SHARED) {
+        protect = PAGE_READWRITE;
+        access = FILE_MAP_WRITE;
+    } else {
+        protect = PAGE_WRITECOPY;
+        access = FILE_MAP_COPY;
+    }
+    /* a section handle maps as it is; a file gets a mapping */
+    mapping = CreateFileMappingW(file, NULL, protect, 0, 0, NULL);
+    if (!mapping) {
+        mapping = file;
+    }
+    ptr = MapViewOfFileEx(mapping, access, (DWORD)((uint64_t)offset >> 32),
+                          (DWORD)offset, len, addr);
+    if (mapping != file) {
+        CloseHandle(mapping);
+    }
+    if (!ptr) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    return ptr;
+}
+
+int qemu_win32_munmap(void *addr, size_t len)
+{
+    return UnmapViewOfFile(addr) ? 0 : -1;
+}

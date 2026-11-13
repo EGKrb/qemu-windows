@@ -13,6 +13,7 @@
 #include "qemu/osdep.h"
 #include "qemu/event_notifier.h"
 #include "qemu/main-loop.h"
+#include "qemu/win32-fdpass.h"
 
 int event_notifier_init(EventNotifier *e, int active)
 {
@@ -30,6 +31,26 @@ void event_notifier_cleanup(EventNotifier *e)
 HANDLE event_notifier_get_handle(EventNotifier *e)
 {
     return e->event;
+}
+
+void event_notifier_init_fd(EventNotifier *e, int fd)
+{
+    e->event = w32fd_token_handle(fd);
+}
+
+int event_notifier_get_fd(const EventNotifier *e)
+{
+    return w32fd_handle_token(e->event);
+}
+
+int event_notifier_get_wfd(const EventNotifier *e)
+{
+    return w32fd_handle_token(e->event);
+}
+
+bool event_notifier_initialized(const EventNotifier *e)
+{
+    return e->event != NULL;
 }
 
 int event_notifier_set(EventNotifier *e)

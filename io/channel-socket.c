@@ -35,6 +35,10 @@
 #endif
 #endif
 
+#ifdef WIN32
+#include "qemu/win32-fdpass.h"
+#endif
+
 #define SOCKET_MAX_FDS 16
 
 #ifdef QEMU_MSG_ZEROCOPY
@@ -450,6 +454,13 @@ static void qio_channel_socket_finalize(Object *obj)
 {
     QIOChannelSocket *ioc = QIO_CHANNEL_SOCKET(obj);
 
+#ifdef WIN32
+    if (ioc->w32fd) {
+        w32fd_state_free(ioc->w32fd);
+        g_free(ioc->w32fd);
+    }
+#endif
+
     if (ioc->fd != -1) {
         QIOChannel *ioc_local = QIO_CHANNEL(ioc);
         if (qio_channel_has_feature(ioc_local, QIO_CHANNEL_FEATURE_LISTEN)) {
@@ -711,6 +722,116 @@ static ssize_t qio_channel_socket_writev(QIOChannel *ioc,
     return ret;
 }
 #else /* WIN32 */
+
+void qio_channel_socket_set_handle_passing(QIOChannelSocket *ioc)
+{
+    if (!ioc->w32fd) {
+        ioc->w32fd = g_new0(W32FdState, 1);
+    }
+    qio_channel_set_feature(QIO_CHANNEL(ioc), QIO_CHANNEL_FEATURE_FD_PASS);
+}
+
+/* QEMU's descriptors: files and sockets of the C runtime, handle tokens */
+static void w32fd_from_fd(int fd, W32FdItem *it)
+{
+    if (w32fd_is_token(fd)) {
+        it->type = W32FD_HANDLE;
+        it->handle = w32fd_token_handle(fd);
+    } else if (fd_is_socket(fd)) {
+        it->type = W32FD_SOCKET;
+        it->handle = (HANDLE)_get_osfhandle(fd);
+    } else {
+        it->type = W32FD_FILE;
+        it->handle = (HANDLE)_get_osfhandle(fd);
+    }
+}
+
+static int w32fd_to_fd(W32FdItem *it)
+{
+    int fd;
+
+    switch (it->type) {
+    case W32FD_HANDLE:
+        return w32fd_handle_token(it->handle);
+    case W32FD_SOCKET:
+        fd = _open_osfhandle((intptr_t)it->handle, _O_BINARY);
+        if (fd < 0) {
+            closesocket((SOCKET)it->handle);
+        }
+        return fd;
+    default:
+        fd = _open_osfhandle((intptr_t)it->handle, _O_RDWR | _O_BINARY);
+        if (fd < 0) {
+            /* not a file after all: keep it as a handle */
+            return w32fd_handle_token(it->handle);
+        }
+        return fd;
+    }
+}
+
+static ssize_t qio_channel_socket_readv_handles(QIOChannelSocket *sioc,
+                                                const struct iovec *iov,
+                                                size_t niov,
+                                                int **fds,
+                                                size_t *nfds,
+                                                Error **errp)
+{
+    W32FdItem items[W32FD_MAX_ITEMS];
+    int nitems = 0, i;
+    ssize_t ret;
+
+    ret = w32fd_recv((SOCKET)_get_osfhandle(sioc->fd), sioc->w32fd, iov,
+                     niov, fds ? items : NULL, fds ? &nitems : NULL,
+                     W32FD_MAX_ITEMS, !sioc->blocking);
+    if (ret < 0) {
+        if (errno == EAGAIN) {
+            return QIO_CHANNEL_ERR_BLOCK;
+        }
+        error_setg_errno(errp, errno, "Unable to read from socket");
+        return -1;
+    }
+    if (fds && nitems) {
+        *fds = g_new(int, nitems);
+        *nfds = 0;
+        for (i = 0; i < nitems; i++) {
+            int fd = w32fd_to_fd(&items[i]);
+
+            if (fd != -1) {
+                (*fds)[(*nfds)++] = fd;
+            }
+        }
+    }
+    return ret;
+}
+
+static ssize_t qio_channel_socket_writev_handles(QIOChannelSocket *sioc,
+                                                 const struct iovec *iov,
+                                                 size_t niov,
+                                                 int *fds,
+                                                 size_t nfds,
+                                                 Error **errp)
+{
+    W32FdItem items[W32FD_MAX_ITEMS];
+    ssize_t ret;
+    size_t i;
+
+    if (nfds > W32FD_MAX_ITEMS) {
+        error_setg_errno(errp, EINVAL, "Only %d FDs can be sent, got %zu",
+                         W32FD_MAX_ITEMS, nfds);
+        return -1;
+    }
+    for (i = 0; i < nfds; i++) {
+        w32fd_from_fd(fds[i], &items[i]);
+    }
+    ret = w32fd_send((SOCKET)_get_osfhandle(sioc->fd), sioc->w32fd, iov,
+                     niov, items, nfds);
+    if (ret < 0) {
+        error_setg_errno(errp, errno, "Unable to write to socket");
+        return -1;
+    }
+    return ret;
+}
+
 static ssize_t qio_channel_socket_readv(QIOChannel *ioc,
                                         const struct iovec *iov,
                                         size_t niov,
@@ -723,6 +844,11 @@ static ssize_t qio_channel_socket_readv(QIOChannel *ioc,
     ssize_t done = 0;
     ssize_t i;
     int sflags = 0;
+
+    if (sioc->w32fd) {
+        return qio_channel_socket_readv_handles(sioc, iov, niov, fds, nfds,
+                                                errp);
+    }
 
     if (flags & QIO_CHANNEL_READ_FLAG_MSG_PEEK) {
         sflags |= MSG_PEEK;
@@ -770,6 +896,11 @@ static ssize_t qio_channel_socket_writev(QIOChannel *ioc,
     QIOChannelSocket *sioc = QIO_CHANNEL_SOCKET(ioc);
     ssize_t done = 0;
     ssize_t i;
+
+    if (sioc->w32fd) {
+        return qio_channel_socket_writev_handles(sioc, iov, niov, fds, nfds,
+                                                 errp);
+    }
 
     for (i = 0; i < niov; i++) {
         ssize_t ret;

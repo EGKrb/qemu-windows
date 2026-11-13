@@ -68,4 +68,4 @@ config VHOST_USER_SCSI
     # Only PCI devices are provided for now
     default y if VIRTIO_PCI
     select VHOST_SCSI_COMMON
-    depends on VIRTIO && VHOST_USER && LINUX
+    depends on VIRTIO && VHOST_USER && (LINUX || WIN32)

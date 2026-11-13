@@ -17,8 +17,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include "standard-headers/linux/vhost_types.h"
+#if !defined(STRUCT_IOVEC_DEFINED) && !defined(QEMU_OSDEP_H)
+#define STRUCT_IOVEC_DEFINED
+struct iovec {
+    void *iov_base;
+    size_t iov_len;
+};
+#endif
+#else
 #include <poll.h>
 #include <linux/vhost.h>
+#endif
 #include <pthread.h>
 #include "standard-headers/linux/virtio_ring.h"
 
@@ -397,6 +409,16 @@ typedef struct VuVirtq {
     struct vhost_vring_addr vra;
 } VuVirtq;
 
+#ifdef _WIN32
+/* the values of poll() on Linux, which are GLib's: not those of WSAPoll() */
+enum VuWatchCondtion {
+    VU_WATCH_IN = 0x001,
+    VU_WATCH_OUT = 0x004,
+    VU_WATCH_PRI = 0x002,
+    VU_WATCH_ERR = 0x008,
+    VU_WATCH_HUP = 0x010,
+};
+#else
 enum VuWatchCondtion {
     VU_WATCH_IN = POLLIN,
     VU_WATCH_OUT = POLLOUT,
@@ -404,6 +426,7 @@ enum VuWatchCondtion {
     VU_WATCH_ERR = POLLERR,
     VU_WATCH_HUP = POLLHUP,
 };
+#endif
 
 typedef void (*vu_panic_cb) (VuDev *dev, const char *err);
 typedef void (*vu_watch_cb) (VuDev *dev, int condition, void *data);

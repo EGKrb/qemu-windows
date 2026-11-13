@@ -791,7 +791,7 @@
             '*seal': 'bool',
             '*guest-memfd': { 'type': 'OnOffAuto',
                               'features': [ 'unstable' ] } },
-  'if': 'CONFIG_LINUX' }
+  'if': { 'any': [ 'CONFIG_LINUX', 'CONFIG_WIN32' ] } }
 
 ##
 # @MemoryBackendShmProperties:
@@ -1279,7 +1279,7 @@
       'if': 'CONFIG_LINUX' },
     'memory-backend-file',
     { 'name': 'memory-backend-memfd',
-      'if': 'CONFIG_LINUX' },
+      'if': { 'any': [ 'CONFIG_LINUX', 'CONFIG_WIN32' ] } },
     'memory-backend-ram',
     'memory-backend-shm',
     'monitor-hmp',
@@ -1356,7 +1356,8 @@
                                       'if': 'CONFIG_LINUX' },
       'memory-backend-file':        'MemoryBackendFileProperties',
       'memory-backend-memfd':       { 'type': 'MemoryBackendMemfdProperties',
-                                      'if': 'CONFIG_LINUX' },
+                                      'if': { 'any': [ 'CONFIG_LINUX',
+                                                       'CONFIG_WIN32' ] } },
       'memory-backend-ram':         'MemoryBackendProperties',
       'memory-backend-shm':         'MemoryBackendShmProperties',
       'monitor-hmp':                'MonitorHMPProperties',

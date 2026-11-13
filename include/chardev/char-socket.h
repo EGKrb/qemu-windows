@@ -50,6 +50,7 @@ struct SocketChardev {
     Chardev parent;
     QIOChannel *ioc; /* Client I/O channel */
     QIOChannelSocket *sioc; /* Client master channel */
+    bool handle_passing;    /* Windows: handles are passed in frames */
     QIONetListener *listener;
     GSource *hup_source;
     QCryptoTLSCreds *tls_creds;

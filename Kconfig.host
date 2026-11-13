@@ -5,6 +5,9 @@
 config LINUX
     bool
 
+config WIN32
+    bool
+
 config LIBCBOR
     bool
 

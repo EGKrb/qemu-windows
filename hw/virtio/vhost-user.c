@@ -31,14 +31,24 @@
 #include "trace.h"
 #include "system/ramblock.h"
 
+#ifndef _WIN32
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#endif
 
 #include "standard-headers/linux/vhost_types.h"
 
 #ifdef CONFIG_LINUX
 #include <linux/userfaultfd.h>
+#endif
+
+#ifdef _WIN32
+#include "qemu/win32-fdpass.h"
+/* the "fds" of event notifiers are handle tokens on Windows */
+#define VHOST_USER_FD_VALID(fd) ((fd) > 0 || w32fd_is_token(fd))
+#else
+#define VHOST_USER_FD_VALID(fd) ((fd) > 0)
 #endif
 
 #define VHOST_MEMORY_BASELINE_NREGIONS    8
@@ -1488,7 +1498,7 @@ static int vhost_set_vring_file(struct vhost_dev *dev,
         msg.hdr.flags |= VHOST_USER_NEED_REPLY_MASK;
     }
 
-    if (file->fd > 0) {
+    if (VHOST_USER_FD_VALID(file->fd)) {
         fds[fd_num++] = file->fd;
     } else {
         msg.payload.u64 |= VHOST_USER_VRING_NOFD_MASK;
@@ -1524,6 +1534,12 @@ static int vhost_user_set_vring_kick(struct vhost_dev *dev,
      * Inject a kick in case the back-end only starts vring processing upon
      * receiving a kick. The spec suggests this to improve compatibility.
      */
+#ifdef _WIN32
+    if (w32fd_is_token(file->fd)) {
+        SetEvent(w32fd_token_handle(file->fd));
+        return 0;
+    }
+#endif
     if (file->fd != -1) {
         uint64_t val = 1;
         ssize_t nwritten;
@@ -3159,6 +3175,8 @@ bool vhost_user_init(VhostUserState *user, CharFrontend *chr, Error **errp)
         return false;
     }
     user->chr = chr;
+    /* Windows: the stream is framed to pass handles, from the start */
+    qemu_chr_fe_set_handle_passing(chr);
     user->memory_slots = 0;
     user->notifiers = g_ptr_array_new_full(VIRTIO_QUEUE_MAX / 4,
                                            &vhost_user_state_destroy);

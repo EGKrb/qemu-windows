@@ -51,6 +51,10 @@ struct QIOChannelSocket {
     ssize_t zero_copy_sent;
     bool blocking;
     bool zero_copy_fallback;
+#ifdef WIN32
+    /* handles passed in frames (subprojects/libvhost-user/win32-fdpass.h) */
+    void *w32fd;
+#endif
 };
 
 
@@ -276,5 +280,17 @@ qio_channel_socket_accept(QIOChannelSocket *ioc,
 int qio_channel_socket_set_send_buffer(QIOChannelSocket *ioc,
                                        size_t size,
                                        Error **errp);
+
+#ifdef WIN32
+/**
+ * qio_channel_socket_set_handle_passing:
+ * @ioc: the socket channel object
+ *
+ * Windows has no SCM_RIGHTS: both ends of an AF_UNIX socket that passes
+ * descriptors frame what they send, from the first byte on.  Turns this
+ * on for @ioc, which then has QIO_CHANNEL_FEATURE_FD_PASS.
+ */
+void qio_channel_socket_set_handle_passing(QIOChannelSocket *ioc);
+#endif
 
 #endif /* QIO_CHANNEL_SOCKET_H */

@@ -757,6 +757,12 @@ int net_init_tap(const Netdev *netdev, const char *name,
     return 0;
 }
 
+/* the descriptor of a TAP device for vhost-net: see net/tap.c */
+int tap_get_fd(NetClientState *nc)
+{
+    return -1;
+}
+
 int tap_enable(NetClientState *nc)
 {
     abort();
