@@ -12,20 +12,32 @@
  *  - the seals live in the file, an extended attribute QEMUSEALS: every
  *    process that has the file reads them; a file without it is not a
  *    memfd (EINVAL, as Linux for files that do not seal);
- *  - the kernel of Windows enforces them for every handle and process,
- *    through a handle of the file kept by the process that sealed it:
- *      F_SEAL_SHRINK  a section of the whole file: Windows refuses to cut
- *                     a file under a section (ERROR_USER_MAPPED_FILE);
+ *  - the kernel of Windows enforces them for every handle and process:
  *      F_SEAL_WRITE,  a shared lock of every byte: Windows refuses writes
  *      F_SEAL_FUTURE_WRITE  to everyone, the locker included;
  *      F_SEAL_GROW    a shared lock from the end of the file: no write
  *                     makes it grow;
- *    plus what Linux refuses on top of that, in mmap()/ftruncate() of
+ *    The locks are taken on the file object of the descriptor and never
+ *    released: every duplicate of the descriptor (fork, or the handle
+ *    passing of qemu/win32-fdpass.h) shares that object, and Windows
+ *    keeps its locks until the last duplicate is closed, in any process,
+ *    whether the process that sealed is still there or not: they last as
+ *    long as the memfd, as on Linux.  A process that receives a sealed
+ *    memfd (qemu_memfd_win32_received()) locks it too: the sender cannot
+ *    unseal by unlocking, Windows lets a process remove its own locks only.
+ *      F_SEAL_SHRINK  a section of the file: Windows refuses to cut a file
+ *                     under a section or a view (ERROR_USER_MAPPED_FILE);
+ *    each process that holds the memfd (sealed or received it, mapped it)
+ *    keeps a section or a view while it holds it.
+ *    Locks and sections belong to a process and go when it exits: the
+ *    process that seals starts qemu-memfd-guard once and gives it each
+ *    sealed memfd, which it locks and maps in its turn until nobody else
+ *    has the memfd (qemu-memfd-guard-win32.c): the seals then hold for as
+ *    long as the memfd exists, whatever process sealed it.
+ *    And what Linux refuses on top of that, in mmap()/ftruncate() of
  *    Windows: shared writable mappings once write-sealed (EPERM), sealing
  *    writes while one exists (EBUSY), growing or shrinking by ftruncate
- *    (EPERM);
- *  - the protection of the kernel holds while the process that sealed
- *    keeps its descriptor open (close() releases it); the seals stay.
+ *    (EPERM).
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -70,15 +82,13 @@ static NtQueryEaFileFn nt_query_ea;
 static NtSetEaFileFn nt_set_ea;
 static NtQueryObjectFn nt_query_object;
 
-/* What the process that sealed keeps, for each file it sealed */
+/*
+ * What a process keeps for a descriptor of a sealed memfd it holds: a
+ * section (F_SEAL_SHRINK), until the descriptor is closed
+ */
 typedef struct SealKeeper {
-    uint64_t volume, index;     /* the file */
-    int fd;                     /* the descriptor that sealed it */
-    HANDLE file;                /* another handle of the file: its locks */
-    HANDLE section;             /* F_SEAL_SHRINK */
-    bool write_locked;          /* lock of every byte */
-    bool grow_locked;           /* lock from grow_from */
-    uint64_t grow_from;
+    int fd;
+    HANDLE section;
     QLIST_ENTRY(SealKeeper) next;
 } SealKeeper;
 
@@ -194,12 +204,12 @@ static int64_t file_size(HANDLE h)
     return GetFileSizeEx(h, &li) ? li.QuadPart : -1;
 }
 
-static SealKeeper *find_keeper(uint64_t volume, uint64_t index)
+static SealKeeper *find_keeper(int fd)
 {
     SealKeeper *k;
 
     QLIST_FOREACH(k, &keepers, next) {
-        if (k->volume == volume && k->index == index) {
+        if (k->fd == fd) {
             return k;
         }
     }
@@ -218,65 +228,181 @@ static bool lock_range(HANDLE h, uint64_t from)
                       (DWORD)(len >> 32), &ov);
 }
 
-static void unlock_range(HANDLE h, uint64_t from)
-{
-    OVERLAPPED ov = { 0 };
-    uint64_t len = UINT64_MAX - from;
+/* qemu-memfd-guard: started once, on the first sealed memfd */
+static HANDLE guard_process;
+static HANDLE guard_pipe;
+static bool guard_tried;
 
-    ov.Offset = (DWORD)from;
-    ov.OffsetHigh = (DWORD)(from >> 32);
-    UnlockFileEx(h, 0, (DWORD)len, (DWORD)(len >> 32), &ov);
+static bool guard_start_from(const char *exe)
+{
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    STARTUPINFOEXW si = { 0 };
+    PROCESS_INFORMATION pi;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs;
+    SIZE_T attrs_size = 0;
+    g_autofree gunichar2 *wexe = NULL;
+    HANDLE rd, wr;
+    DWORD flags = DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT;
+    BOOL ok;
+
+    if (!exe || !g_file_test(exe, G_FILE_TEST_IS_REGULAR)) {
+        return false;
+    }
+    wexe = g_utf8_to_utf16(exe, -1, NULL, NULL, NULL);
+    if (!wexe || !CreatePipe(&rd, &wr, &sa, 0)) {
+        return false;
+    }
+    SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0);
+
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
+    attrs = g_malloc(attrs_size);
+    InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size);
+    UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                              &rd, sizeof(rd), NULL, NULL);
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = rd;
+    si.lpAttributeList = attrs;
+
+    /* out of a job that would kill it with us, when the job allows it */
+    ok = CreateProcessW((wchar_t *)wexe, NULL, NULL, NULL, TRUE,
+                        flags | CREATE_BREAKAWAY_FROM_JOB, NULL, NULL,
+                        &si.StartupInfo, &pi);
+    if (!ok) {
+        ok = CreateProcessW((wchar_t *)wexe, NULL, NULL, NULL, TRUE, flags,
+                            NULL, NULL, &si.StartupInfo, &pi);
+    }
+    DeleteProcThreadAttributeList(attrs);
+    g_free(attrs);
+    CloseHandle(rd);
+    if (!ok) {
+        CloseHandle(wr);
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    guard_process = pi.hProcess;
+    guard_pipe = wr;
+    return true;
+}
+
+static bool guard_start(void)
+{
+    wchar_t wpath[MAX_PATH];
+    g_autofree char *self = NULL, *dir = NULL, *here = NULL, *helper = NULL;
+
+    /*
+     * Where it is: QEMU_MEMFD_GUARD, next to the program, or in libexec
+     * under the prefix (bindir is the prefix on Windows)
+     */
+    DWORD len;
+
+    if (guard_process || guard_tried) {
+        return guard_process != NULL;
+    }
+    guard_tried = true;
+    len = GetModuleFileNameW(NULL, wpath, MAX_PATH);
+    if (len && len < MAX_PATH) {
+        self = g_utf16_to_utf8(wpath, len, NULL, NULL, NULL);
+        dir = self ? g_path_get_dirname(self) : NULL;
+        if (dir) {
+            here = g_build_filename(dir, "qemu-memfd-guard.exe", NULL);
+            helper = g_build_filename(dir, "libexec", "qemu-memfd-guard.exe",
+                                      NULL);
+        }
+    }
+    if (guard_start_from(getenv("QEMU_MEMFD_GUARD")) ||
+        guard_start_from(here) || guard_start_from(helper)) {
+        return true;
+    }
+    warn_report_once("memfd: qemu-memfd-guard not found: the seals hold "
+                     "while this process holds the memfd");
+    return false;
+}
+
+/* Give the guard a duplicate of @h (the same file object) and @seals */
+static void guard_send(HANDLE h, uint32_t seals)
+{
+    struct {
+        uint64_t handle;
+        uint32_t seals;
+        uint32_t pad;
+    } m = { 0 };
+    HANDLE dup;
+    DWORD n;
+
+    if (!guard_start()) {
+        return;
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), h, guard_process, &dup, 0,
+                         FALSE, DUPLICATE_SAME_ACCESS)) {
+        return;
+    }
+    m.handle = (uint64_t)(uintptr_t)dup;
+    m.seals = seals;
+    if (!WriteFile(guard_pipe, &m, sizeof(m), &n, NULL) || n != sizeof(m)) {
+        /* the guard is gone: close what it would have kept */
+        DuplicateHandle(guard_process, dup, NULL, NULL, 0, FALSE,
+                        DUPLICATE_CLOSE_SOURCE);
+    }
 }
 
 static void keeper_free(SealKeeper *k)
 {
-    if (k->write_locked) {
-        unlock_range(k->file, 0);
-    }
-    if (k->grow_locked) {
-        unlock_range(k->file, k->grow_from);
-    }
     if (k->section) {
         CloseHandle(k->section);
-    }
-    if (k->file) {
-        CloseHandle(k->file);
     }
     g_free(k);
 }
 
-/* The kernel side of @seals, on a handle of our own */
-static int enforce(SealKeeper *k, HANDLE h, uint32_t seals)
+/*
+ * The kernel side of @seals for descriptor @fd (handle @h) of this
+ * process: locks on its file object (never released: they go with the
+ * file object), a section kept while @fd is open.  Called with seal_lock.
+ */
+static void enforce(int fd, HANDLE h, uint32_t seals)
 {
-    if (!k->file) {
-        k->file = ReOpenFile(h, GENERIC_READ,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE |
-                             FILE_SHARE_DELETE, 0);
-        if (k->file == INVALID_HANDLE_VALUE) {
-            k->file = NULL;
-            errno = EIO;
-            return -1;
-        }
-    }
-    if ((seals & F_SEAL_SHRINK) && !k->section && file_size(h) > 0) {
-        k->section = CreateFileMappingW(k->file, NULL, PAGE_READONLY, 0, 0,
-                                        NULL);
-    }
-    if ((seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) && !k->write_locked) {
-        if (k->grow_locked) {
-            unlock_range(k->file, k->grow_from);
-            k->grow_locked = false;
-        }
-        k->write_locked = lock_range(k->file, 0);
-    } else if ((seals & F_SEAL_GROW) && !k->write_locked && !k->grow_locked) {
+    SealKeeper *k;
+
+    if (seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) {
+        lock_range(h, 0);
+    } else if (seals & F_SEAL_GROW) {
         int64_t size = file_size(h);
 
         if (size >= 0) {
-            k->grow_from = size;
-            k->grow_locked = lock_range(k->file, size);
+            lock_range(h, size);
         }
     }
-    return 0;
+    /* past the life of this process */
+    guard_send(h, seals);
+    if ((seals & F_SEAL_SHRINK) && file_size(h) > 0) {
+        k = find_keeper(fd);
+        if (!k) {
+            k = g_new0(SealKeeper, 1);
+            k->fd = fd;
+            QLIST_INSERT_HEAD(&keepers, k, next);
+        }
+        if (!k->section) {
+            k->section = CreateFileMappingW(h, NULL, PAGE_READONLY, 0, 0,
+                                            NULL);
+        }
+    }
+}
+
+void qemu_memfd_win32_received(int fd)
+{
+    HANDLE h = fd_handle(fd);
+    int seals;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    seals = read_seals(h);
+    if (seals <= 0) {
+        return;
+    }
+    AcquireSRWLockExclusive(&seal_lock);
+    enforce(fd, h, seals);
+    ReleaseSRWLockExclusive(&seal_lock);
 }
 
 int qemu_memfd_get_seals(int fd)
@@ -300,7 +426,6 @@ int qemu_memfd_add_seals(int fd, unsigned int seals)
 {
     HANDLE h = fd_handle(fd);
     uint64_t volume, index;
-    SealKeeper *k;
     SealView *v;
     int cur, ret = 0;
 
@@ -333,20 +458,12 @@ int qemu_memfd_add_seals(int fd, unsigned int seals)
             }
         }
     }
-    k = find_keeper(volume, index);
-    if (!k) {
-        k = g_new0(SealKeeper, 1);
-        k->volume = volume;
-        k->index = index;
-        k->fd = fd;
-        QLIST_INSERT_HEAD(&keepers, k, next);
-    }
     if (!write_seals(h, cur | seals)) {
         errno = EIO;
         ret = -1;
         goto out;
     }
-    ret = enforce(k, h, cur | seals);
+    enforce(fd, h, cur | seals);
 out:
     ReleaseSRWLockExclusive(&seal_lock);
     return ret;

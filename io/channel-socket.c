@@ -37,6 +37,7 @@
 
 #ifdef WIN32
 #include "qemu/win32-fdpass.h"
+#include "qemu/memfd.h"
 #endif
 
 #define SOCKET_MAX_FDS 16
@@ -773,6 +774,8 @@ static int w32fd_to_fd(W32FdItem *it)
             /* not a file after all: keep it as a handle */
             return w32fd_handle_token(it->handle);
         }
+        /* a sealed memfd: this process enforces its seals too */
+        qemu_memfd_win32_received(fd);
         return fd;
     }
 }

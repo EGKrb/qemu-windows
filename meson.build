@@ -4629,6 +4629,11 @@ if have_tools
   endif
 
   if host_os == 'windows'
+    # keeps the seals of memfds past the process that sealed them
+    executable('qemu-memfd-guard', files('qemu-memfd-guard-win32.c'),
+               win_subsystem: 'windows',
+               install: true, install_dir: get_option('libexecdir'))
+
     # SCSI persistent reservations: the handle of the device comes from
     # QEMU, SG_IO is the SCSI pass-through of Windows
     executable('qemu-pr-helper', files('scsi/qemu-pr-helper.c', 'scsi/utils.c',

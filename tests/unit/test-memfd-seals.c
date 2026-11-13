@@ -180,11 +180,143 @@ static void test_close(void)
     int fd = qemu_memfd_create("t", SZ, false, 0,
                                F_SEAL_SHRINK | F_SEAL_WRITE, &error_abort);
     wchar_t path[MAX_PATH];
+    int i;
 
     g_assert(GetFinalPathNameByHandleW((HANDLE)_get_osfhandle(fd), path,
                                        MAX_PATH, 0));
     g_assert(GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES);
     close(fd);
+    /* qemu-memfd-guard lets it go within half a second */
+    for (i = 0; i < 50 && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+         i++) {
+        Sleep(100);
+    }
+    g_assert(GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES);
+}
+
+/*
+ * The seals outlive the descriptor that sealed: a duplicate of it (what
+ * another process gets by handle passing) still cannot write
+ */
+static void test_persist(void)
+{
+    char buf[8] = "x";
+    int fd = qemu_memfd_create("t", 65536, false, 0,
+                               F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK,
+                               &error_abort);
+    HANDLE dup;
+
+    g_assert_true(DuplicateHandle(GetCurrentProcess(),
+                                  (HANDLE)_get_osfhandle(fd),
+                                  GetCurrentProcess(), &dup, 0, FALSE,
+                                  DUPLICATE_SAME_ACCESS));
+    close(fd);
+    g_assert_false(raw_write(dup, 0, buf, 1));
+    g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
+    g_assert_false(raw_write(dup, 65536, buf, 1));
+    g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
+    CloseHandle(dup);
+}
+
+/*
+ * A process that receives a sealed memfd enforces the seals too: they
+ * stay when the sender lets go of its descriptor
+ */
+static void test_received(void)
+{
+    char buf[8] = "x";
+    int fd = qemu_memfd_create("t", 65536, false, 0,
+                               F_SEAL_SHRINK | F_SEAL_GROW, &error_abort);
+    HANDLE dup, other;
+    int rfd;
+
+    g_assert_true(DuplicateHandle(GetCurrentProcess(),
+                                  (HANDLE)_get_osfhandle(fd),
+                                  GetCurrentProcess(), &dup, 0, FALSE,
+                                  DUPLICATE_SAME_ACCESS));
+    rfd = _open_osfhandle((intptr_t)dup, _O_RDWR | _O_BINARY);
+    g_assert_cmpint(rfd, >=, 0);
+    qemu_memfd_win32_received(rfd);
+    g_assert_cmpint(qemu_memfd_get_seals(rfd), ==,
+                    F_SEAL_SHRINK | F_SEAL_GROW);
+    close(fd);          /* the sender is gone */
+
+    other = other_handle(rfd);
+    g_assert_false(raw_truncate(other, 4096));
+    g_assert_cmpint(GetLastError(), ==, ERROR_USER_MAPPED_FILE);
+    g_assert_false(raw_write(other, 65536, buf, 1));
+    g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
+    CloseHandle(other);
+    close(rfd);
+}
+
+/*
+ * The seals outlive the process that sealed (qemu-memfd-guard): a child
+ * seals, gives us a duplicate and exits; the kernel still refuses writes
+ * and truncation; when we let go too, the memfd ends
+ */
+static void test_guard(void)
+{
+    const char *hfile = g_getenv("MEMFD_TEST_HANDLE_FILE");
+    g_autofree char *contents = NULL;
+    wchar_t path[MAX_PATH];
+    char buf[8] = "x";
+    HANDLE h;
+    int i, rfd;
+
+    if (g_test_subprocess()) {
+        HANDLE parent = OpenProcess(PROCESS_DUP_HANDLE, FALSE,
+                                    atoi(g_getenv("MEMFD_TEST_PARENT")));
+        int fd = qemu_memfd_create("t", 65536, false, 0,
+                                   F_SEAL_WRITE | F_SEAL_SHRINK |
+                                   F_SEAL_GROW, &error_abort);
+        g_autofree char *v = NULL;
+        HANDLE dup;
+
+        g_assert(parent);
+        g_assert_true(DuplicateHandle(GetCurrentProcess(),
+                                      (HANDLE)_get_osfhandle(fd), parent,
+                                      &dup, 0, FALSE, DUPLICATE_SAME_ACCESS));
+        v = g_strdup_printf("%llu", (unsigned long long)(uintptr_t)dup);
+        g_assert_true(g_file_set_contents(hfile, v, -1, NULL));
+        close(fd);      /* the sealer lets go, then exits */
+        return;
+    }
+
+    hfile = g_build_filename(g_get_tmp_dir(), "qemu-memfd-guard-test", NULL);
+    g_setenv("MEMFD_TEST_HANDLE_FILE", hfile, TRUE);
+    g_setenv("MEMFD_TEST_PARENT",
+             g_strdup_printf("%lu", GetCurrentProcessId()), TRUE);
+    g_test_trap_subprocess(NULL, 0, G_TEST_SUBPROCESS_INHERIT_STDERR);
+    g_test_trap_assert_passed();
+    g_assert_true(g_file_get_contents(hfile, &contents, NULL, NULL));
+    g_remove(hfile);
+    h = (HANDLE)(uintptr_t)g_ascii_strtoull(contents, NULL, 10);
+
+    /* the sealer is gone: still sealed, by the kernel */
+    Sleep(200);
+    g_assert_false(raw_write(h, 0, buf, 1));
+    g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
+    g_assert_false(raw_write(h, 65536, buf, 1));
+    g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
+    g_assert_false(raw_truncate(h, 4096));
+    g_assert_cmpint(GetLastError(), ==, ERROR_USER_MAPPED_FILE);
+
+    /*
+     * We take it as a receiver: our guard holds it too, with the guard of
+     * the child; once we let go, neither keeps the other one alive
+     */
+    rfd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+    g_assert_cmpint(rfd, >=, 0);
+    qemu_memfd_win32_received(rfd);
+
+    /* nobody holds it any more: it ends */
+    g_assert(GetFinalPathNameByHandleW(h, path, MAX_PATH, 0));
+    close(rfd);
+    for (i = 0; i < 50 && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+         i++) {
+        Sleep(100);
+    }
     g_assert(GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES);
 }
 
@@ -198,5 +330,8 @@ int main(int argc, char **argv)
     g_test_add_func("/memfd/write", test_write_seal);
     g_test_add_func("/memfd/future-write", test_future_write_seal);
     g_test_add_func("/memfd/close", test_close);
+    g_test_add_func("/memfd/persist", test_persist);
+    g_test_add_func("/memfd/received", test_received);
+    g_test_add_func("/memfd/guard", test_guard);
     return g_test_run();
 }

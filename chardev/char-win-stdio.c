@@ -38,6 +38,7 @@ struct WinStdioChardev {
     HANDLE  hInputDoneEvent;
     HANDLE  hInputThread;
     uint8_t win_stdio_buf;
+    bool win_stdio_pending;     /* a byte read, not taken yet */
 };
 typedef struct WinStdioChardev WinStdioChardev;
 
@@ -138,11 +139,28 @@ static void win_stdio_thread_wait_func(void *opaque)
     Chardev *chr = CHARDEV(opaque);
     WinStdioChardev *stdio = WIN_STDIO_CHARDEV(opaque);
 
-    if (qemu_chr_be_can_write(chr)) {
-        qemu_chr_be_write(chr, &stdio->win_stdio_buf, 1);
+    /*
+     * The frontend may not take it now (QMP stops reading while it runs a
+     * command): keep the byte, as Linux leaves it in the pipe, until
+     * chr_accept_input says the frontend reads again
+     */
+    if (!qemu_chr_be_can_write(chr)) {
+        stdio->win_stdio_pending = true;
+        return;
     }
-
+    qemu_chr_be_write(chr, &stdio->win_stdio_buf, 1);
     SetEvent(stdio->hInputDoneEvent);
+}
+
+static void win_stdio_chr_accept_input(Chardev *chr)
+{
+    WinStdioChardev *stdio = WIN_STDIO_CHARDEV(chr);
+
+    if (stdio->win_stdio_pending && qemu_chr_be_can_write(chr)) {
+        stdio->win_stdio_pending = false;
+        qemu_chr_be_write(chr, &stdio->win_stdio_buf, 1);
+        SetEvent(stdio->hInputDoneEvent);
+    }
 }
 
 static void win_stdio_chr_set_echo(Chardev *chr, bool echo)
@@ -283,6 +301,7 @@ static void char_win_stdio_class_init(ObjectClass *oc, const void *data)
     cc->chr_open = win_stdio_chr_open;
     cc->chr_write = win_stdio_chr_write;
     cc->chr_set_echo = win_stdio_chr_set_echo;
+    cc->chr_accept_input = win_stdio_chr_accept_input;
 }
 
 static const TypeInfo char_win_stdio_type_info = {
