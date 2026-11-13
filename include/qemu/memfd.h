@@ -63,7 +63,8 @@ int qemu_memfd_win32_map_check(HANDLE file, int prot, int flags);
 void qemu_memfd_win32_mapped(HANDLE file, void *addr);
 void qemu_memfd_win32_unmapped(void *addr);
 int qemu_memfd_win32_truncate_check(HANDLE file, int64_t length);
-void qemu_memfd_win32_close(int fd);
+/* Before close(): what to set after it (NULL if nothing), see close() */
+HANDLE qemu_memfd_win32_close(int fd);
 /* @fd came from another process: if it is a sealed memfd, enforce it too */
 void qemu_memfd_win32_received(int fd);
 #endif

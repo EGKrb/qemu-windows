@@ -42,6 +42,30 @@ static BOOL raw_truncate(HANDLE h, int64_t len)
     return SetFilePointerEx(h, li, NULL, FILE_BEGIN) && SetEndOfFile(h);
 }
 
+/*
+ * Milliseconds until the file of a memfd is gone from its directory (its
+ * memory freed: a file that is only delete pending is still listed), or -1
+ */
+static double gone_after_ms(const wchar_t *path)
+{
+    LARGE_INTEGER f, t0, t;
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    do {
+        h = FindFirstFileW(path, &fd);
+        QueryPerformanceCounter(&t);
+        if (h == INVALID_HANDLE_VALUE) {
+            return (t.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
+        }
+        FindClose(h);
+        SwitchToThread();
+    } while (t.QuadPart - t0.QuadPart < 5 * f.QuadPart);
+    return -1;
+}
+
 static void test_no_sealing(void)
 {
     int fd = memfd_create("t", 0);
@@ -180,18 +204,18 @@ static void test_close(void)
     int fd = qemu_memfd_create("t", SZ, false, 0,
                                F_SEAL_SHRINK | F_SEAL_WRITE, &error_abort);
     wchar_t path[MAX_PATH];
-    int i;
+    double ms;
 
     g_assert(GetFinalPathNameByHandleW((HANDLE)_get_osfhandle(fd), path,
                                        MAX_PATH, 0));
     g_assert(GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES);
+    /* sealed and closed at once: the guard holds it already, then lets go */
     close(fd);
-    /* qemu-memfd-guard lets it go within half a second */
-    for (i = 0; i < 50 && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-         i++) {
-        Sleep(100);
-    }
-    g_assert(GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES);
+    /* close() tells the guard: at once, as on Linux */
+    ms = gone_after_ms(path);
+    g_test_message("gone %.1f ms after close()", ms);
+    g_assert_cmpfloat(ms, >=, 0);
+    g_assert_cmpfloat(ms, <, 50);
 }
 
 /*
@@ -204,7 +228,9 @@ static void test_persist(void)
     int fd = qemu_memfd_create("t", 65536, false, 0,
                                F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK,
                                &error_abort);
+    wchar_t path[MAX_PATH];
     HANDLE dup;
+    double ms;
 
     g_assert_true(DuplicateHandle(GetCurrentProcess(),
                                   (HANDLE)_get_osfhandle(fd),
@@ -215,7 +241,13 @@ static void test_persist(void)
     g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
     g_assert_false(raw_write(dup, 65536, buf, 1));
     g_assert_cmpint(GetLastError(), ==, ERROR_LOCK_VIOLATION);
+    /* the last handle closed without close() of QEMU: the guard's check */
+    g_assert(GetFinalPathNameByHandleW(dup, path, MAX_PATH, 0));
     CloseHandle(dup);
+    ms = gone_after_ms(path);
+    g_test_message("gone %.1f ms after CloseHandle()", ms);
+    g_assert_cmpfloat(ms, >=, 0);
+    g_assert_cmpfloat(ms, <, 300);
 }
 
 /*
@@ -262,7 +294,8 @@ static void test_guard(void)
     wchar_t path[MAX_PATH];
     char buf[8] = "x";
     HANDLE h;
-    int i, rfd;
+    int rfd;
+    double ms;
 
     if (g_test_subprocess()) {
         HANDLE parent = OpenProcess(PROCESS_DUP_HANDLE, FALSE,
@@ -313,11 +346,10 @@ static void test_guard(void)
     /* nobody holds it any more: it ends */
     g_assert(GetFinalPathNameByHandleW(h, path, MAX_PATH, 0));
     close(rfd);
-    for (i = 0; i < 50 && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-         i++) {
-        Sleep(100);
-    }
-    g_assert(GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES);
+    ms = gone_after_ms(path);
+    g_test_message("gone %.1f ms after the last close()", ms);
+    g_assert_cmpfloat(ms, >=, 0);
+    g_assert_cmpfloat(ms, <, 50);
 }
 
 int main(int argc, char **argv)

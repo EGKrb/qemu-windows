@@ -563,9 +563,18 @@ int qemu_close_wrap(int fd)
     int ret = -1;
 
     if (!fd_is_socket(fd)) {
-        /* what keeps the seals of a memfd sealed through @fd */
-        qemu_memfd_win32_close(fd);
-        return close(fd);
+        /*
+         * A sealed memfd: what this process kept for it goes; once it is
+         * closed, its guards are told (it may have been the last one)
+         */
+        HANDLE guards = qemu_memfd_win32_close(fd);
+
+        ret = close(fd);
+        if (guards) {
+            SetEvent(guards);
+            CloseHandle(guards);
+        }
+        return ret;
     }
 
     s = _get_osfhandle(fd);

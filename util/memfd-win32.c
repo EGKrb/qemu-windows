@@ -89,6 +89,7 @@ static NtQueryObjectFn nt_query_object;
 typedef struct SealKeeper {
     int fd;
     HANDLE section;
+    uint64_t volume, index;     /* the file: its event for the guards */
     QLIST_ENTRY(SealKeeper) next;
 } SealKeeper;
 
@@ -230,7 +231,8 @@ static bool lock_range(HANDLE h, uint64_t from)
 
 /* qemu-memfd-guard: started once, on the first sealed memfd */
 static HANDLE guard_process;
-static HANDLE guard_pipe;
+static HANDLE guard_pipe;       /* memfds to the guard */
+static HANDLE guard_ack;        /* a byte back for each: it holds it */
 static bool guard_tried;
 
 static bool guard_start_from(const char *exe)
@@ -241,7 +243,7 @@ static bool guard_start_from(const char *exe)
     LPPROC_THREAD_ATTRIBUTE_LIST attrs;
     SIZE_T attrs_size = 0;
     g_autofree gunichar2 *wexe = NULL;
-    HANDLE rd, wr;
+    HANDLE rd, wr, ack_rd, ack_wr, inherit[2];
     DWORD flags = DETACHED_PROCESS | EXTENDED_STARTUPINFO_PRESENT;
     BOOL ok;
 
@@ -252,16 +254,25 @@ static bool guard_start_from(const char *exe)
     if (!wexe || !CreatePipe(&rd, &wr, &sa, 0)) {
         return false;
     }
+    if (!CreatePipe(&ack_rd, &ack_wr, &sa, 0)) {
+        CloseHandle(rd);
+        CloseHandle(wr);
+        return false;
+    }
     SetHandleInformation(wr, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(ack_rd, HANDLE_FLAG_INHERIT, 0);
+    inherit[0] = rd;
+    inherit[1] = ack_wr;
 
     InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
     attrs = g_malloc(attrs_size);
     InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size);
     UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                              &rd, sizeof(rd), NULL, NULL);
+                              inherit, sizeof(inherit), NULL, NULL);
     si.StartupInfo.cb = sizeof(si);
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     si.StartupInfo.hStdInput = rd;
+    si.StartupInfo.hStdOutput = ack_wr;
     si.lpAttributeList = attrs;
 
     /* out of a job that would kill it with us, when the job allows it */
@@ -275,13 +286,16 @@ static bool guard_start_from(const char *exe)
     DeleteProcThreadAttributeList(attrs);
     g_free(attrs);
     CloseHandle(rd);
+    CloseHandle(ack_wr);    /* the guard's end: its exit ends our reads */
     if (!ok) {
         CloseHandle(wr);
+        CloseHandle(ack_rd);
         return false;
     }
     CloseHandle(pi.hThread);
     guard_process = pi.hProcess;
     guard_pipe = wr;
+    guard_ack = ack_rd;
     return true;
 }
 
@@ -343,6 +357,16 @@ static void guard_send(HANDLE h, uint32_t seals)
         /* the guard is gone: close what it would have kept */
         DuplicateHandle(guard_process, dup, NULL, NULL, 0, FALSE,
                         DUPLICATE_CLOSE_SOURCE);
+        return;
+    }
+    /*
+     * Wait until it holds it: then the seals hold whatever we do next
+     * (close at once, end); a dead guard ends the read
+     */
+    {
+        char ack;
+
+        ReadFile(guard_ack, &ack, 1, &n, NULL);
     }
 }
 
@@ -374,13 +398,15 @@ static void enforce(int fd, HANDLE h, uint32_t seals)
     }
     /* past the life of this process */
     guard_send(h, seals);
+    /* every descriptor of a sealed memfd: close() tells the guards */
+    k = find_keeper(fd);
+    if (!k) {
+        k = g_new0(SealKeeper, 1);
+        k->fd = fd;
+        file_id(h, &k->volume, &k->index);
+        QLIST_INSERT_HEAD(&keepers, k, next);
+    }
     if ((seals & F_SEAL_SHRINK) && file_size(h) > 0) {
-        k = find_keeper(fd);
-        if (!k) {
-            k = g_new0(SealKeeper, 1);
-            k->fd = fd;
-            QLIST_INSERT_HEAD(&keepers, k, next);
-        }
         if (!k->section) {
             k->section = CreateFileMappingW(h, NULL, PAGE_READONLY, 0, 0,
                                             NULL);
@@ -530,21 +556,36 @@ int qemu_memfd_win32_truncate_check(HANDLE file, int64_t length)
     return 0;
 }
 
-void qemu_memfd_win32_close(int fd)
+HANDLE qemu_memfd_win32_close(int fd)
 {
     SealKeeper *k, *tmp;
+    HANDLE ev = NULL;
 
     if (QLIST_EMPTY(&keepers)) {
-        return;
+        return NULL;
     }
     AcquireSRWLockExclusive(&seal_lock);
     QLIST_FOREACH_SAFE(k, &keepers, next, tmp) {
         if (k->fd == fd) {
+            wchar_t name[64];
+
+            /*
+             * The event of the guards of this memfd (qemu-memfd-guard):
+             * set after the close, it wakes them to see whether it was the
+             * last descriptor
+             */
+            if (!ev) {
+                swprintf(name, 64, L"Local\\qemu-memfd-%08llx-%016llx",
+                         (unsigned long long)k->volume,
+                         (unsigned long long)k->index);
+                ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+            }
             QLIST_REMOVE(k, next);
             keeper_free(k);
         }
     }
     ReleaseSRWLockExclusive(&seal_lock);
+    return ev;
 }
 
 int memfd_create(const char *name, unsigned int flags)

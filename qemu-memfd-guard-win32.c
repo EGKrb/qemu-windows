@@ -6,41 +6,43 @@
  * byte-range locks and sections (util/memfd-win32.c), which belong to a
  * process: they go when it exits.  A process that seals (or receives) a
  * memfd starts this guard once and gives it a duplicate of each sealed
- * memfd (the same file object) over a pipe, with the seals; the guard
- * locks and maps it in its turn, so the seals hold after the process that
- * sealed is gone.
+ * memfd over a pipe, with the seals; the guard opens the file again (its
+ * own open: it does not keep the memfd's descriptors alive), locks and
+ * maps it, so the seals hold after the process that sealed is gone.
  *
- * When to let a memfd go: when nobody but guards has a handle to its file
- * object.  Each guard holds one handle per memfd (a second one given to it
- * is merged into the first) and counts itself in the file, an extended
- * attribute QEMUGUARDS changed under a named mutex: the memfd is free when
- * NtQueryObject's HandleCount is no more than that count.  The memfd then
- * ends as on Linux when its last descriptor is closed.  A guard that is
- * killed leaves the count too high: the others let go a little early,
- * never too late.  A guard exits when its parent is gone and it guards
- * nothing more.
+ * The end of a memfd: it is created delete-on-close, so when the last
+ * descriptor of the memfd is closed, in any process, Windows marks the file
+ * delete pending (its name is gone at once, as on Linux).  The guard then
+ * closes its open and the file goes.  Being told at once: each memfd has
+ * a named event Local\qemu-memfd-<volume>-<index>, which close() of QEMU
+ * sets after closing a sealed memfd, and which a guard sets for all its
+ * memfds when its parent ends (its pipe closes); guards wait on it in the
+ * thread pool.  A program that is not QEMU closes without telling: a check
+ * every 100 ms catches that (Windows gives no notice of the last close of
+ * a locked file: oplocks, the only such notice, cannot be held on a file
+ * with byte-range locks).
  *
  * Messages on the pipe (standard input): { uint64 handle in the guard,
- * uint32 seals, uint32 0 }.
+ * uint32 seals, uint32 0 }; the guard answers each with one byte on its
+ * standard output once it holds the memfd: the process that seals goes on
+ * then, so the seals hold even if it ends at once.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
 
 #include <windows.h>
-#include <winternl.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #define F_SEAL_SHRINK       0x0002
 #define F_SEAL_GROW         0x0004
 #define F_SEAL_WRITE        0x0008
 #define F_SEAL_FUTURE_WRITE 0x0010
 
-#define GUARDS_EA_NAME "QEMUGUARDS"
-#define POLL_MS 250
+#define POLL_MS 100
 
 typedef struct {
     uint64_t handle;
@@ -49,81 +51,19 @@ typedef struct {
 } GuardMsg;
 
 typedef struct Guarded {
-    HANDLE file;
+    HANDLE file;            /* our own open of the memfd's file */
     HANDLE section;
+    HANDLE event;           /* Local\qemu-memfd-<volume>-<index> */
+    HANDLE wait;
+    uint64_t volume, index;
     uint32_t seals;
+    bool released;
     struct Guarded *next;
 } Guarded;
-
-/* FILE_FULL_EA_INFORMATION / FILE_GET_EA_INFORMATION of the DDK */
-typedef struct {
-    ULONG NextEntryOffset;
-    UCHAR Flags;
-    UCHAR EaNameLength;
-    USHORT EaValueLength;
-    CHAR EaName[sizeof(GUARDS_EA_NAME)];
-    int32_t value;
-} __attribute__((packed)) CountEa;
-
-typedef struct {
-    ULONG NextEntryOffset;
-    UCHAR EaNameLength;
-    CHAR EaName[sizeof(GUARDS_EA_NAME)];
-} __attribute__((packed)) CountEaQuery;
-
-typedef NTSTATUS (NTAPI *NtQueryObjectFn)(HANDLE, OBJECT_INFORMATION_CLASS,
-                                          PVOID, ULONG, PULONG);
-typedef NTSTATUS (NTAPI *NtQueryEaFileFn)(HANDLE, PIO_STATUS_BLOCK, PVOID,
-                                          ULONG, BOOLEAN, PVOID, ULONG,
-                                          PULONG, BOOLEAN);
-typedef NTSTATUS (NTAPI *NtSetEaFileFn)(HANDLE, PIO_STATUS_BLOCK, PVOID,
-                                        ULONG);
-typedef BOOL (WINAPI *CompareObjectHandlesFn)(HANDLE, HANDLE);
-
-static NtQueryObjectFn nt_query_object;
-static NtQueryEaFileFn nt_query_ea;
-static NtSetEaFileFn nt_set_ea;
-static CompareObjectHandlesFn compare_handles;
-static HANDLE count_mutex;
 
 static CRITICAL_SECTION lock;
 static Guarded *guarded;
 static volatile LONG parent_gone;
-
-/* The number of guards that hold the memfd of @h */
-static int32_t count_read(HANDLE h)
-{
-    CountEaQuery q __attribute__((aligned(8))) = { 0 };
-    union {
-        CountEa ea;
-        uint8_t room[128];
-    } u __attribute__((aligned(8))) = { 0 };
-    IO_STATUS_BLOCK iosb;
-
-    q.EaNameLength = strlen(GUARDS_EA_NAME);
-    memcpy(q.EaName, GUARDS_EA_NAME, sizeof(GUARDS_EA_NAME));
-    if (nt_query_ea(h, &iosb, &u, sizeof(u), TRUE, &q, sizeof(q), NULL,
-                    TRUE) < 0 || u.ea.EaValueLength != sizeof(int32_t)) {
-        return 0;
-    }
-    return u.ea.value;
-}
-
-static void count_add(HANDLE h, int32_t delta)
-{
-    CountEa ea __attribute__((aligned(8))) = { 0 };
-    IO_STATUS_BLOCK iosb;
-    int32_t n;
-
-    WaitForSingleObject(count_mutex, INFINITE);
-    n = count_read(h) + delta;
-    ea.EaNameLength = strlen(GUARDS_EA_NAME);
-    ea.EaValueLength = sizeof(int32_t);
-    memcpy(ea.EaName, GUARDS_EA_NAME, sizeof(GUARDS_EA_NAME));
-    ea.value = n > 0 ? n : 0;
-    nt_set_ea(h, &iosb, &ea, sizeof(ea));
-    ReleaseMutex(count_mutex);
-}
 
 static void lock_from(HANDLE h, uint64_t from)
 {
@@ -158,16 +98,95 @@ static void enforce(Guarded *g, uint32_t seals)
     g->seals |= seals;
 }
 
-static void guard(HANDLE h, uint32_t seals)
+/* Every last descriptor of the memfd closed: Windows deletes it */
+static bool ended(Guarded *g)
 {
-    Guarded *g;
+    FILE_STANDARD_INFO si;
+
+    return !GetFileInformationByHandleEx(g->file, FileStandardInfo, &si,
+                                         sizeof(si)) || si.DeletePending;
+}
+
+/* Let @g go (with the lock held): the file goes with our open */
+static void release(Guarded *g)
+{
+    if (g->released) {
+        return;
+    }
+    g->released = true;
+    /* a pending wait is unregistered by the main loop, before freeing */
+    if (g->section) {
+        CloseHandle(g->section);
+        g->section = NULL;
+    }
+    CloseHandle(g->file);
+    g->file = NULL;
+}
+
+static void CALLBACK woken(void *opaque, BOOLEAN timeout);
+
+static void watch(Guarded *g)
+{
+    if (!g->event || !RegisterWaitForSingleObject(&g->wait, g->event, woken,
+                                                  g, INFINITE,
+                                                  WT_EXECUTEONLYONCE)) {
+        g->wait = NULL;
+    }
+}
+
+/* A process closed a sealed memfd, or ended: is this one over? */
+static void CALLBACK woken(void *opaque, BOOLEAN timeout)
+{
+    Guarded *g = opaque;
 
     EnterCriticalSection(&lock);
-    /* a memfd we hold already: one handle per memfd */
+    if (!g->released) {
+        /* reset first: a close after it sets the event again */
+        ResetEvent(g->event);
+        if (g->wait) {
+            UnregisterWait(g->wait);
+            g->wait = NULL;
+        }
+        if (ended(g)) {
+            release(g);
+        } else {
+            watch(g);
+        }
+    }
+    LeaveCriticalSection(&lock);
+}
+
+static void guard(HANDLE dup, uint32_t seals)
+{
+    BY_HANDLE_FILE_INFORMATION info;
+    wchar_t name[64];
+    Guarded *g;
+    HANDLE h;
+
+    /* our own open: the memfd's descriptors end without us */
+    h = ReOpenFile(dup, GENERIC_READ,
+                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+    CloseHandle(dup);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    if (!GetFileInformationByHandle(h, &info)) {
+        CloseHandle(h);
+        return;
+    }
+
+    EnterCriticalSection(&lock);
     for (g = guarded; g; g = g->next) {
-        if (compare_handles && compare_handles(g->file, h)) {
+        if (!g->released && g->volume == info.dwVolumeSerialNumber &&
+            g->index == ((uint64_t)info.nFileIndexHigh << 32 |
+                         info.nFileIndexLow)) {
+            /* a memfd we hold already: more seals perhaps */
             CloseHandle(h);
             enforce(g, seals);
+            /* the duplicate we closed may have been its last descriptor */
+            if (g->event) {
+                SetEvent(g->event);
+            }
             LeaveCriticalSection(&lock);
             return;
         }
@@ -179,10 +198,26 @@ static void guard(HANDLE h, uint32_t seals)
         return;
     }
     g->file = h;
-    count_add(h, 1);
+    g->volume = info.dwVolumeSerialNumber;
+    g->index = (uint64_t)info.nFileIndexHigh << 32 | info.nFileIndexLow;
+    swprintf(name, 64, L"Local\\qemu-memfd-%08llx-%016llx",
+             (unsigned long long)g->volume, (unsigned long long)g->index);
+    g->event = CreateEventW(NULL, TRUE, FALSE, name);
     enforce(g, seals);
     g->next = guarded;
     guarded = g;
+    /*
+     * The duplicate we closed may have been the last descriptor of the
+     * memfd: tell the other guards of it (we look ourselves just below)
+     */
+    if (g->event) {
+        SetEvent(g->event);
+    }
+    if (ended(g)) {
+        release(g);
+    } else {
+        watch(g);
+    }
     LeaveCriticalSection(&lock);
 }
 
@@ -190,33 +225,39 @@ static void guard(HANDLE h, uint32_t seals)
 static DWORD WINAPI reader(void *opaque)
 {
     HANDLE in = opaque;
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     GuardMsg m;
     DWORD n;
+    Guarded *g;
+    char ack = 1;
 
     while (ReadFile(in, &m, sizeof(m), &n, NULL) && n == sizeof(m)) {
         guard((HANDLE)(uintptr_t)m.handle, m.seals);
+        /* held: the parent may go on */
+        WriteFile(out, &ack, 1, &n, NULL);
     }
+    /*
+     * The parent ended: its descriptors are closed now, without close() of
+     * QEMU: wake every guard of its memfds (us included)
+     */
     InterlockedExchange(&parent_gone, 1);
+    EnterCriticalSection(&lock);
+    for (g = guarded; g; g = g->next) {
+        if (!g->released && g->event) {
+            SetEvent(g->event);
+        }
+    }
+    LeaveCriticalSection(&lock);
     return 0;
 }
 
 int main(void)
 {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE t;
 
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-    nt_query_object = (NtQueryObjectFn)(void *)GetProcAddress(ntdll,
-                                                              "NtQueryObject");
-    nt_query_ea = (NtQueryEaFileFn)(void *)GetProcAddress(ntdll,
-                                                          "NtQueryEaFile");
-    nt_set_ea = (NtSetEaFileFn)(void *)GetProcAddress(ntdll, "NtSetEaFile");
-    compare_handles = (CompareObjectHandlesFn)(void *)GetProcAddress(
-        GetModuleHandleW(L"kernelbase.dll"), "CompareObjectHandles");
-    count_mutex = CreateMutexW(NULL, FALSE, L"Local\\qemu-memfd-guard-count");
-    if (!nt_query_object || !nt_query_ea || !nt_set_ea || !count_mutex ||
-        in == NULL || in == INVALID_HANDLE_VALUE) {
+    if (in == NULL || in == INVALID_HANDLE_VALUE) {
         return 1;
     }
     InitializeCriticalSection(&lock);
@@ -227,32 +268,37 @@ int main(void)
     CloseHandle(t);
 
     for (;;) {
-        Guarded **pp, *g;
+        Guarded **pp, *g, *done = NULL;
         bool empty;
 
         Sleep(POLL_MS);
         EnterCriticalSection(&lock);
         for (pp = &guarded; (g = *pp);) {
-            PUBLIC_OBJECT_BASIC_INFORMATION info;
-            ULONG len;
-
-            /* only guards hold the memfd: let it end */
-            if (nt_query_object(g->file, ObjectBasicInformation, &info,
-                                sizeof(info), &len) < 0 ||
-                (LONG)info.HandleCount <= count_read(g->file)) {
+            /* programs that are not QEMU close without telling us */
+            if (!g->released && ended(g)) {
+                release(g);
+            }
+            if (g->released) {
                 *pp = g->next;
-                count_add(g->file, -1);
-                if (g->section) {
-                    CloseHandle(g->section);
-                }
-                CloseHandle(g->file);      /* its locks go with it */
-                free(g);
+                g->next = done;
+                done = g;
             } else {
                 pp = &g->next;
             }
         }
         empty = guarded == NULL;
         LeaveCriticalSection(&lock);
+        /* out of the lock: a callback in progress may want it */
+        while ((g = done)) {
+            done = g->next;
+            if (g->wait) {
+                UnregisterWaitEx(g->wait, INVALID_HANDLE_VALUE);
+            }
+            if (g->event) {
+                CloseHandle(g->event);
+            }
+            free(g);
+        }
         if (empty && parent_gone) {
             return 0;
         }
