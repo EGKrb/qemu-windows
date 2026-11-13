@@ -35,6 +35,11 @@
 #include "net/tap.h"            /* tap_has_ufo, ... */
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "qemu/cutils.h"
+#include "qemu/sockets.h"
+#include "qemu/win32-fdpass.h"
+#include "qapi/error.h"
+#include "tap-win32-adapter.h"
 #include <windows.h>
 #include <winioctl.h>
 
@@ -112,9 +117,9 @@ typedef struct tap_win32_overlapped {
     tun_buffer_t* free_list;
     tun_buffer_t* output_queue_front;
     tun_buffer_t* output_queue_back;
+    HANDLE thread;
+    volatile bool stopping;
 } tap_win32_overlapped_t;
-
-static tap_win32_overlapped_t tap_overlapped;
 
 static tun_buffer_t* get_buffer_from_free_list(tap_win32_overlapped_t* const overlapped)
 {
@@ -518,7 +523,7 @@ static DWORD WINAPI tap_win32_thread_entry(LPVOID param)
     tun_buffer_t* buffer = get_buffer_from_free_list(overlapped);
 
 
-    for (;;) {
+    while (!overlapped->stopping) {
         result = ReadFile(overlapped->handle,
                           buffer->buffer,
                           sizeof(buffer->buffer),
@@ -553,6 +558,9 @@ static DWORD WINAPI tap_win32_thread_entry(LPVOID param)
             }
         }
 
+        if (overlapped->stopping) {
+            break;
+        }
         if(read_size > 0) {
             buffer->read_size = read_size;
             put_buffer_on_output_queue(overlapped, buffer);
@@ -589,87 +597,156 @@ static void tap_win32_free_buffer(tap_win32_overlapped_t *overlapped,
     put_buffer_on_free_list(overlapped, buffer);
 }
 
-static int tap_win32_open(tap_win32_overlapped_t **phandle,
-                          const char *preferred_name)
+/*
+ * The TAP device: opened by its adapter name (ifname=), given as a handle
+ * (fd=, from a parent process or qemu-bridge-helper), or a new adapter
+ * (as Linux creates tapN when no ifname is given), removed at the end.
+ * Each netdev has its own buffers and reading thread.
+ */
+static tap_win32_overlapped_t *tap_win32_start(HANDLE handle, Error **errp)
 {
-    g_autofree char *device_path = NULL;
-    char device_guid[0x100];
-    int rc;
-    HANDLE handle;
-    BOOL bret;
-    char name_buffer[0x100] = {0, };
     struct {
         unsigned long major;
         unsigned long minor;
         unsigned long debug;
     } version;
     DWORD version_len;
-    DWORD idThread;
+    tap_win32_overlapped_t *ov;
 
-    if (preferred_name != NULL) {
-        snprintf(name_buffer, sizeof(name_buffer), "%s", preferred_name);
+    if (!DeviceIoControl(handle, TAP_IOCTL_GET_VERSION,
+                         &version, sizeof(version),
+                         &version, sizeof(version), &version_len, NULL)) {
+        error_setg(errp, "not a TAP-Windows device");
+        return NULL;
     }
-
-    rc = get_device_guid(device_guid, sizeof(device_guid), name_buffer, sizeof(name_buffer));
-    if (rc)
-        return -1;
-
-    device_path = g_strdup_printf("%s%s%s",
-              USERMODEDEVICEDIR,
-              device_guid,
-              TAPSUFFIX);
-
-    handle = CreateFile (
-        device_path,
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        0,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED,
-        0 );
-
-    if (handle == INVALID_HANDLE_VALUE) {
-        return -1;
-    }
-
-    bret = DeviceIoControl(handle, TAP_IOCTL_GET_VERSION,
-                           &version, sizeof (version),
-                           &version, sizeof (version), &version_len, NULL);
-
-    if (bret == FALSE) {
-        CloseHandle(handle);
-        return -1;
-    }
-
     if (!tap_win32_set_status(handle, TRUE)) {
-        return -1;
+        error_setg_win32(errp, GetLastError(), "cannot bring the TAP up");
+        return NULL;
     }
+    ov = g_new0(tap_win32_overlapped_t, 1);
+    tap_win32_overlapped_init(ov, handle);
+    ov->thread = CreateThread(NULL, 0, tap_win32_thread_entry, ov, 0, NULL);
+    return ov;
+}
 
-    tap_win32_overlapped_init(&tap_overlapped, handle);
-
-    *phandle = &tap_overlapped;
-
-    CreateThread(NULL, 0, tap_win32_thread_entry,
-                 (LPVOID)&tap_overlapped, 0, &idThread);
-    return 0;
+static void tap_win32_stop(tap_win32_overlapped_t *ov)
+{
+    ov->stopping = true;
+    CancelIoEx(ov->handle, NULL);
+    /* a thread waiting for a free buffer */
+    ReleaseSemaphore(ov->free_list_semaphore, 1, NULL);
+    if (ov->thread) {
+        WaitForSingleObject(ov->thread, 5000);
+        CloseHandle(ov->thread);
+    }
+    tap_win32_set_status(ov->handle, FALSE);
+    CloseHandle(ov->handle);
+    CloseHandle(ov->read_event);
+    CloseHandle(ov->write_event);
+    CloseHandle(ov->output_queue_semaphore);
+    CloseHandle(ov->free_list_semaphore);
+    CloseHandle(ov->tap_semaphore);
+    DeleteCriticalSection(&ov->output_queue_cs);
+    DeleteCriticalSection(&ov->free_list_cs);
+    g_free(ov);
 }
 
 /********************************************/
 
- typedef struct TAPState {
-     NetClientState nc;
-     tap_win32_overlapped_t *handle;
- } TAPState;
+typedef struct TAPState {
+    NetClientState nc;
+    tap_win32_overlapped_t *handle;
+    char ifname[128];
+    char down_script[1024];
+    char *created_guid;     /* the adapter made for this netdev */
+    HANDLE helper;          /* qemu-bridge-helper, while the TAP is used */
+} TAPState;
+
+/* Run @script with @ifname, as launch_script() of net/tap.c */
+static int tap_win32_run_script(const char *script, const char *ifname,
+                                Error **errp)
+{
+    g_autofree char *cmd = NULL;
+    const char *ext = strrchr(script, '.');
+    g_autoptr(GError) gerr = NULL;
+    int status;
+
+    if (ext && !g_ascii_strcasecmp(ext, ".ps1")) {
+        cmd = g_strdup_printf("powershell.exe -NoProfile -ExecutionPolicy "
+                              "Bypass -File \"%s\" \"%s\"", script, ifname);
+    } else if (ext && (!g_ascii_strcasecmp(ext, ".bat") ||
+                       !g_ascii_strcasecmp(ext, ".cmd"))) {
+        cmd = g_strdup_printf("cmd.exe /c \"\"%s\" \"%s\"\"", script, ifname);
+    } else {
+        cmd = g_strdup_printf("\"%s\" \"%s\"", script, ifname);
+    }
+    if (!g_spawn_command_line_sync(cmd, NULL, NULL, &status, &gerr)) {
+        error_setg(errp, "could not launch network script %s: %s", script,
+                   gerr->message);
+        return -1;
+    }
+    if (!g_spawn_check_wait_status(status, NULL)) {
+        error_setg(errp, "network script %s failed with status %d", script,
+                   status);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * The scripts of Windows: the name given, else qemu-ifup / qemu-ifdown of
+ * the configuration directory with the extension found (.bat, .cmd, .ps1,
+ * .exe), if any; "no" for none
+ */
+static char *tap_win32_script(const char *given, const char *def)
+{
+    static const char *const exts[] = { "", ".bat", ".cmd", ".ps1", ".exe" };
+    g_autofree char *base = NULL;
+    size_t i;
+
+    if (given) {
+        return g_str_equal(given, "no") || !*given ? NULL : g_strdup(given);
+    }
+    base = get_relocated_path(def);
+    for (i = 0; i < G_N_ELEMENTS(exts); i++) {
+        g_autofree char *p = g_strconcat(base, exts[i], NULL);
+
+        if (g_file_test(p, G_FILE_TEST_IS_REGULAR)) {
+            return g_steal_pointer(&p);
+        }
+    }
+    return NULL;
+}
 
 static void tap_cleanup(NetClientState *nc)
 {
     TAPState *s = DO_UPCAST(TAPState, nc, nc);
+    Error *err = NULL;
 
+    if (!s->handle) {
+        return;
+    }
     qemu_del_wait_object(s->handle->tap_semaphore, NULL, NULL);
-
-    /* FIXME: need to kill thread and close file handle:
-       tap_win32_close(s);
-    */
+    if (s->down_script[0]) {
+        if (tap_win32_run_script(s->down_script, s->ifname, &err) < 0) {
+            error_report_err(err);
+            err = NULL;
+        }
+    }
+    tap_win32_stop(s->handle);
+    s->handle = NULL;
+    if (s->created_guid) {
+        if (!tap_win32_adapter_remove(s->created_guid, &err)) {
+            error_report_err(err);
+        }
+        g_free(s->created_guid);
+        s->created_guid = NULL;
+    }
+    if (s->helper) {
+        /* qemu-bridge-helper removes its adapter when we are gone */
+        CloseHandle(s->helper);
+        s->helper = NULL;
+    }
 }
 
 static ssize_t tap_receive(NetClientState *nc, const uint8_t *buf, size_t size)
@@ -711,49 +788,347 @@ static NetClientInfo net_tap_win32_info = {
     .cleanup = tap_cleanup,
 };
 
-static int tap_win32_init(NetClientState *peer, const char *model,
-                          const char *name, const char *ifname)
+static TAPState *tap_win32_new(NetClientState *peer, const char *model,
+                               const char *name, HANDLE handle,
+                               const char *ifname, Error **errp)
 {
+    tap_win32_overlapped_t *ov = tap_win32_start(handle, errp);
     NetClientState *nc;
     TAPState *s;
-    tap_win32_overlapped_t *handle;
 
-    if (tap_win32_open(&handle, ifname) < 0) {
-        printf("tap: Could not open '%s'\n", ifname);
-        return -1;
+    if (!ov) {
+        CloseHandle(handle);
+        return NULL;
+    }
+    nc = qemu_new_net_client(&net_tap_win32_info, peer, model, name);
+    s = DO_UPCAST(TAPState, nc, nc);
+    s->handle = ov;
+    pstrcpy(s->ifname, sizeof(s->ifname), ifname ? ifname : "");
+    qemu_add_wait_object(ov->tap_semaphore, tap_win32_send, s);
+    return s;
+}
+
+/* A handle given as a number: one this process inherited */
+static HANDLE tap_win32_handle_arg(const char *str, Error **errp)
+{
+    unsigned long long v;
+
+    if (qemu_strtou64(str, NULL, 0, &v) < 0 || !v) {
+        error_setg(errp, "invalid handle '%s'", str);
+        return NULL;
+    }
+    return (HANDLE)(uintptr_t)v;
+}
+
+/*
+ * qemu-bridge-helper: started with one end of a socket pair, it sends the
+ * handle of a TAP device added to the bridge, and lives while QEMU does to
+ * remove it afterwards.  It takes administrator rights.
+ */
+static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
+                                   HANDLE *process, Error **errp)
+{
+    W32FdState st = { 0 };
+    W32FdItem items[W32FD_MAX_ITEMS];
+    STARTUPINFOEXW si = { 0 };
+    PROCESS_INFORMATION pi;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    SIZE_T attrs_size = 0;
+    g_autofree char *cmdline = NULL;
+    g_autofree gunichar2 *wcmd = NULL;
+    HANDLE child_sock, child_err = NULL, ret = NULL;
+    HANDLE inherit[2];
+    int sv[2], nitems = 0, ninherit = 0, i;
+    char byte;
+    struct iovec iov = { &byte, 1 };
+    ssize_t n;
+
+    if (qemu_socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        error_setg_errno(errp, errno, "socketpair() failed");
+        return NULL;
+    }
+    child_sock = (HANDLE)_get_osfhandle(sv[1]);
+    SetHandleInformation(child_sock, HANDLE_FLAG_INHERIT,
+                         HANDLE_FLAG_INHERIT);
+
+    if (strstr(helper, " ")) {
+        /* a command line, as on Linux where /bin/sh runs it */
+        cmdline = g_strdup_printf("%s --use-vnet --fd=%llu%s%s", helper,
+                                  (unsigned long long)(uintptr_t)child_sock,
+                                  strstr(helper, "--br=") ? "" : " --br=",
+                                  strstr(helper, "--br=") ? "" : bridge);
+    } else {
+        cmdline = g_strdup_printf("\"%s\" --use-vnet --fd=%llu --br=%s",
+                                  helper,
+                                  (unsigned long long)(uintptr_t)child_sock,
+                                  bridge);
+    }
+    wcmd = g_utf8_to_utf16(cmdline, -1, NULL, NULL, NULL);
+
+    /* its messages go to our stderr, as on Linux */
+    inherit[ninherit++] = child_sock;
+    if (DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE),
+                        GetCurrentProcess(), &child_err, 0, TRUE,
+                        DUPLICATE_SAME_ACCESS)) {
+        inherit[ninherit++] = child_err;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdError = child_err;
     }
 
-    nc = qemu_new_net_client(&net_tap_win32_info, peer, model, name);
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
+    attrs = g_malloc(attrs_size);
+    si.StartupInfo.cb = sizeof(si);
+    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size) ||
+        !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherit, ninherit * sizeof(HANDLE), NULL,
+                                   NULL)) {
+        error_setg_win32(errp, GetLastError(), "cannot start the helper");
+        goto out;
+    }
+    si.lpAttributeList = attrs;
+    if (!CreateProcessW(NULL, (wchar_t *)wcmd, NULL, NULL, TRUE,
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                        NULL, NULL, &si.StartupInfo, &pi)) {
+        error_setg_win32(errp, GetLastError(), "cannot run %s", cmdline);
+        goto out;
+    }
+    CloseHandle(pi.hThread);
+    close(sv[1]);
+    sv[1] = -1;
 
-    s = DO_UPCAST(TAPState, nc, nc);
+    /*
+     * Wait for the frame or for the end of the helper: a socket inherited by
+     * a process that exits does not always show EOF to its peer.
+     */
+    {
+        SOCKET s0 = (SOCKET)_get_osfhandle(sv[0]);
+        WSAEVENT ev = WSACreateEvent();
+        HANDLE hs[2] = { ev, pi.hProcess };
+        u_long blocking = 0;
+        fd_set rfds;
+        struct timeval tv = { 0, 0 };
 
-    qemu_set_info_str(&s->nc, "tap: ifname=%s", ifname);
+        WSAEventSelect(s0, ev, FD_READ | FD_CLOSE);
+        WaitForMultipleObjects(2, hs, FALSE, 120 * 1000);
+        WSAEventSelect(s0, NULL, 0);
+        WSACloseEvent(ev);
+        ioctlsocket(s0, FIONBIO, &blocking);
+        FD_ZERO(&rfds);
+        FD_SET(s0, &rfds);
+        if (select(0, &rfds, NULL, NULL, &tv) != 1) {
+            DWORD code = STILL_ACTIVE;
 
-    s->handle = handle;
+            GetExitCodeProcess(pi.hProcess, &code);
+            if (code == STILL_ACTIVE) {
+                TerminateProcess(pi.hProcess, 1);
+                error_setg(errp, "bridge helper did not answer");
+            } else {
+                error_setg(errp, "bridge helper failed (exit code %lu)",
+                           (unsigned long)code);
+            }
+            CloseHandle(pi.hProcess);
+            goto out;
+        }
+    }
 
-    qemu_add_wait_object(s->handle->tap_semaphore, tap_win32_send, s);
+    /* one byte with the handle of the TAP device */
+    n = w32fd_recv((SOCKET)_get_osfhandle(sv[0]), &st, &iov, 1, items,
+                   &nitems, W32FD_MAX_ITEMS, false);
+    for (i = 0; i < nitems; i++) {
+        if (!ret && items[i].type != W32FD_SOCKET) {
+            ret = items[i].handle;
+        } else if (items[i].type == W32FD_SOCKET) {
+            closesocket((SOCKET)items[i].handle);
+        } else {
+            CloseHandle(items[i].handle);
+        }
+    }
+    if (n <= 0 || !ret) {
+        DWORD code = 0;
 
-    return 0;
+        WaitForSingleObject(pi.hProcess, 10000);
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hProcess);
+        error_setg(errp, "bridge helper failed (exit code %lu)",
+                   (unsigned long)code);
+        ret = NULL;
+        goto out;
+    }
+    /* our end stays open: the helper sees it close when QEMU ends */
+    *process = pi.hProcess;
+    sv[0] = -1;
+out:
+    if (attrs) {
+        DeleteProcThreadAttributeList(attrs);
+        g_free(attrs);
+    }
+    if (child_err) {
+        CloseHandle(child_err);
+    }
+    if (sv[1] >= 0) {
+        close(sv[1]);
+    }
+    if (sv[0] >= 0) {
+        close(sv[0]);
+    }
+    w32fd_state_free(&st);
+    return ret;
 }
 
 int net_init_tap(const Netdev *netdev, const char *name,
                  NetClientState *peer, Error **errp)
 {
-    /* FIXME error_setg(errp, ...) on failure */
     const NetdevTapOptions *tap;
+    g_autofree char *script = NULL;
+    g_autofree char *downscript = NULL;
+    g_autofree char *guid = NULL;
+    g_autofree char *ifname = NULL;
+    char *created = NULL;
+    HANDLE handle = NULL, helper_process = NULL;
+    TAPState *s;
 
     assert(netdev->type == NET_CLIENT_DRIVER_TAP);
     tap = &netdev->u.tap;
 
-    if (!tap->ifname) {
-        error_report("tap: no interface name");
+    if (tap->has_vnet_hdr && tap->vnet_hdr) {
+        error_setg(errp, "vnet_hdr=on is not supported by TAP-Windows");
+        return -1;
+    }
+    if (tap->has_vhost && tap->vhost) {
+        error_setg(errp, "vhost=on needs the vhost-net driver of Windows");
+        return -1;
+    }
+    if (tap->vhostfd || tap->vhostfds) {
+        error_setg(errp, "vhostfd= needs the vhost-net driver of Windows");
+        return -1;
+    }
+    if (tap->has_queues && tap->queues > 1) {
+        error_setg(errp, "TAP-Windows has one queue: queues must be 1");
+        return -1;
+    }
+    if (tap->fds && strchr(tap->fds, ':')) {
+        error_setg(errp, "TAP-Windows has one queue: one handle in fds");
         return -1;
     }
 
-    if (tap_win32_init(peer, "tap", name, tap->ifname) == -1) {
-        return -1;
+    if (tap->fd || tap->fds) {
+        /* a TAP device opened by the parent process, inherited */
+        if (tap->ifname || tap->script || tap->downscript || tap->helper) {
+            error_setg(errp, "ifname=, script=, downscript= and helper= are "
+                       "invalid with fd=");
+            return -1;
+        }
+        handle = tap_win32_handle_arg(tap->fd ? tap->fd : tap->fds, errp);
+        if (!handle) {
+            return -1;
+        }
+        s = tap_win32_new(peer, "tap", name, handle, NULL, errp);
+        if (!s) {
+            return -1;
+        }
+        qemu_set_info_str(&s->nc, "fd=%s", tap->fd ? tap->fd : tap->fds);
+        return 0;
     }
 
+    if (tap->helper) {
+        if (tap->ifname || tap->script || tap->downscript) {
+            error_setg(errp, "ifname=, script= and downscript= are invalid "
+                       "with helper=");
+            return -1;
+        }
+        handle = tap_win32_run_helper(tap->helper, tap->br ?: "br0",
+                                      &helper_process, errp);
+        if (!handle) {
+            return -1;
+        }
+        s = tap_win32_new(peer, "tap", name, handle, NULL, errp);
+        if (!s) {
+            CloseHandle(helper_process);
+            return -1;
+        }
+        s->helper = helper_process;
+        qemu_set_info_str(&s->nc, "helper=%s", tap->helper);
+        return 0;
+    }
+
+    if (tap->ifname) {
+        guid = tap_win32_adapter_find(tap->ifname);
+        if (!guid) {
+            error_setg(errp, "no TAP-Windows adapter named '%s'",
+                       tap->ifname);
+            return -1;
+        }
+        ifname = g_strdup(tap->ifname);
+    } else {
+        /* as Linux makes tapN: a new adapter, removed at the end */
+        guid = tap_win32_adapter_create(NULL, &ifname, errp);
+        if (!guid) {
+            return -1;
+        }
+        created = g_strdup(guid);
+    }
+    handle = tap_win32_adapter_open(guid, errp);
+    if (!handle) {
+        goto fail;
+    }
+
+    script = tap_win32_script(tap->script, DEFAULT_NETWORK_SCRIPT);
+    downscript = tap_win32_script(tap->downscript,
+                                  DEFAULT_NETWORK_DOWN_SCRIPT);
+    if (script && tap_win32_run_script(script, ifname, errp) < 0) {
+        CloseHandle(handle);
+        goto fail;
+    }
+
+    s = tap_win32_new(peer, "tap", name, handle, ifname, errp);
+    if (!s) {
+        goto fail;
+    }
+    s->created_guid = created;
+    if (downscript) {
+        pstrcpy(s->down_script, sizeof(s->down_script), downscript);
+    }
+    qemu_set_info_str(&s->nc, "ifname=%s,script=%s,downscript=%s", ifname,
+                      script ?: "no", downscript ?: "no");
+    return 0;
+
+fail:
+    if (created) {
+        tap_win32_adapter_remove(created, NULL);
+        g_free(created);
+    }
+    return -1;
+}
+
+int net_init_bridge(const Netdev *netdev, const char *name,
+                    NetClientState *peer, Error **errp)
+{
+    const NetdevBridgeOptions *bridge;
+    g_autofree char *default_helper = NULL;
+    const char *helper, *br;
+    HANDLE handle, process = NULL;
+    TAPState *s;
+
+    assert(netdev->type == NET_CLIENT_DRIVER_BRIDGE);
+    bridge = &netdev->u.bridge;
+    helper = bridge->helper;
+    if (!helper) {
+        helper = default_helper = get_relocated_path(DEFAULT_BRIDGE_HELPER
+                                                     ".exe");
+    }
+    br = bridge->br ?: DEFAULT_BRIDGE_INTERFACE;
+
+    handle = tap_win32_run_helper(helper, br, &process, errp);
+    if (!handle) {
+        return -1;
+    }
+    s = tap_win32_new(peer, "bridge", name, handle, NULL, errp);
+    if (!s) {
+        CloseHandle(process);
+        return -1;
+    }
+    s->helper = process;
+    qemu_set_info_str(&s->nc, "helper=%s,br=%s", helper, br);
     return 0;
 }
 
@@ -763,12 +1138,13 @@ int tap_get_fd(NetClientState *nc)
     return -1;
 }
 
+/* one queue: always enabled */
 int tap_enable(NetClientState *nc)
 {
-    abort();
+    return 0;
 }
 
 int tap_disable(NetClientState *nc)
 {
-    abort();
+    return 0;
 }

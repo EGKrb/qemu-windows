@@ -61,7 +61,7 @@ Windows does not have; what replaces it, if anything).
 | Backend | Windows |
 | --- | --- |
 | user (slirp), socket, stream, dgram, hubport | same |
-| tap | TAP-Windows adapters (upstream); `vhost=`, `script=`, `helper=`, `fds=` **todo** |
+| tap, bridge | **done** (VM test pending): `ifname=` an adapter by name; no `ifname=` = a new adapter tapN, removed at the end (SetupAPI root\tap0901, `net/tap-win32-adapter.c`); `script=`/`downscript=` (.ps1/.bat/.cmd/.exe, default `etc\qemu-ifup`/`qemu-ifdown` with any of these extensions, `no`); `fd=`/`fds=` = an inherited handle number (overlapped); `helper=` and `-netdev bridge` = qemu-bridge-helper (handle sent over a socket pair). One queue: `queues>1`, `vnet_hdr=on` refused; `vhost=` needs the vhost-net driver (**todo**) |
 | vhost-user | **done**: both ends of the AF_UNIX socket frame the stream and duplicate handles into the peer (`util/win32-fdpass.c`, as SCM_RIGHTS would pass descriptors); `contrib/vhost-user-bridge` ported (tested: ping through it) |
 | vhost-net, vhost-vdpa, af-xdp, netmap, passt, l2tpv3, vde | **no** (Linux kernel or Linux-only programs) |
 | `-netdev user,smb=` | **todo** |
@@ -84,5 +84,5 @@ Windows does not have; what replaces it, if anything).
 | linux-user (`qemu-ARCH`) | **todo**: a native prototype for aarch64; otherwise through WSL |
 | bsd-user | **no** |
 | qemu-vnc | **done**: sockets given to QEMU as WSAPROTOCOL_INFOW (the Win32 D-Bus display API), Win32 map scanouts, AddClient; tested over a session bus |
-| qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, vhost-user backends of contrib | **todo** / **todo** / **no** / vhost-user-bridge done, others **todo** |
+| qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, vhost-user backends of contrib | **done** (`qemu-bridge-helper-win32.c`: bridge.conf ACL, makes a TAP adapter, `netsh bridge add`, sends its handle, removes it when QEMU ends; needs administrator rights) / **todo** / **no** / vhost-user-bridge done, others **todo** |
 | modules (`--enable-modules`) | **todo** (DLLs) |

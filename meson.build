@@ -4628,6 +4628,16 @@ if have_tools
     subdir('contrib/vhost-user-scsi')
   endif
 
+  if host_os == 'windows'
+    # TAP-Windows adapters in a network bridge of Windows
+    executable('qemu-bridge-helper',
+               files('qemu-bridge-helper-win32.c', 'net/tap-win32-adapter.c'),
+               dependencies: [qemuutil, cc.find_library('setupapi'),
+                              cc.find_library('iphlpapi'),
+                              cc.find_library('ole32')],
+               install: true,
+               install_dir: get_option('libexecdir'))
+  endif
   if host_os == 'linux'
     executable('qemu-bridge-helper', files('qemu-bridge-helper.c'),
                dependencies: [qemuutil, libcap_ng],

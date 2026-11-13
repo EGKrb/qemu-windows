@@ -59,10 +59,8 @@
 #include "qapi/qobject-input-visitor.h"
 #include "standard-headers/linux/virtio_net.h"
 
-/* Net bridge is currently not supported for W32. */
-#if !defined(_WIN32)
-# define CONFIG_NET_BRIDGE
-#endif
+/* Windows: qemu-bridge-helper with TAP-Windows (net/tap-win32.c) */
+#define CONFIG_NET_BRIDGE
 
 static VMChangeStateEntry *net_change_state_entry;
 NetClientStateList net_clients;

@@ -53,7 +53,9 @@ endif
 stub_ss.add(files('vhost-user-stub.c'))
 
 if host_os == 'windows'
-  system_ss.add(files('tap-win32.c'))
+  system_ss.add(files('tap-win32.c', 'tap-win32-adapter.c'))
+  system_ss.add(cc.find_library('setupapi'), cc.find_library('iphlpapi'),
+                cc.find_library('ole32'))
 elif host_os == 'linux'
   system_ss.add(files('tap.c', 'tap-linux.c'))
 elif host_os in bsd_oses
