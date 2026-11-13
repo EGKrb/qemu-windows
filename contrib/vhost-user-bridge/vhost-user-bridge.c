@@ -33,8 +33,12 @@
 #include "qemu/atomic.h"
 #include "qemu/ctype.h"
 #include "qemu/iov.h"
+#include "qemu/sockets.h"
 #include "standard-headers/linux/virtio_net.h"
 #include "libvhost-user.h"
+#ifdef _WIN32
+#include "qemu/win32-fdpass.h"
+#endif
 
 #define VHOST_USER_BRIDGE_DEBUG 1
 
@@ -56,11 +60,29 @@ typedef struct Event {
     CallbackFunc callback;
 } Event;
 
+#ifdef _WIN32
+/*
+ * Windows: select() only takes sockets; kick "fds" are events (handle
+ * tokens).  Sockets get an event of WSAEventSelect(), and all events are
+ * waited for together.
+ */
+#define DISPATCHER_MAX MAXIMUM_WAIT_OBJECTS
+typedef struct Dispatcher {
+    int n;
+    struct {
+        int fd;
+        HANDLE wait;        /* the event to wait for */
+        bool socket;        /* @wait was made for the socket */
+        Event event;
+    } entries[DISPATCHER_MAX];
+} Dispatcher;
+#else
 typedef struct Dispatcher {
     int max_sock;
     fd_set fdset;
     Event events[FD_SETSIZE];
 } Dispatcher;
+#endif
 
 typedef struct VubrDev {
     VuDev vudev;
@@ -85,6 +107,121 @@ vubr_die(const char *s)
     exit(1);
 }
 
+#ifdef _WIN32
+static int
+dispatcher_init(Dispatcher *dispr)
+{
+    dispr->n = 0;
+    return 0;
+}
+
+static int
+dispatcher_add(Dispatcher *dispr, int sock, void *ctx, CallbackFunc cb)
+{
+    int i = dispr->n;
+
+    if (i == DISPATCHER_MAX) {
+        fprintf(stderr, "Error: Failed to add new event: too many\n");
+        return -1;
+    }
+    dispr->entries[i].fd = sock;
+    dispr->entries[i].event.ctx = ctx;
+    dispr->entries[i].event.callback = cb;
+    if (w32fd_is_token(sock)) {
+        dispr->entries[i].wait = w32fd_token_handle(sock);
+        dispr->entries[i].socket = false;
+    } else {
+        WSAEVENT ev = WSACreateEvent();
+
+        WSAEventSelect((SOCKET)_get_osfhandle(sock), ev,
+                       FD_READ | FD_ACCEPT | FD_CLOSE);
+        dispr->entries[i].wait = ev;
+        dispr->entries[i].socket = true;
+    }
+    dispr->n++;
+    DPRINT("Added sock %d for watching.\n", sock);
+    return 0;
+}
+
+static int
+dispatcher_remove(Dispatcher *dispr, int sock)
+{
+    int i;
+
+    for (i = 0; i < dispr->n; i++) {
+        if (dispr->entries[i].fd == sock) {
+            if (dispr->entries[i].socket) {
+                WSAEventSelect((SOCKET)_get_osfhandle(sock), NULL, 0);
+                WSACloseEvent(dispr->entries[i].wait);
+            }
+            dispr->entries[i] = dispr->entries[--dispr->n];
+            DPRINT("Sock %d removed from dispatcher watch.\n", sock);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* timeout in us */
+static int
+dispatcher_wait(Dispatcher *dispr, uint32_t timeout)
+{
+    HANDLE waits[DISPATCHER_MAX];
+    DWORD rc;
+    int i, fd;
+
+    for (i = 0; i < dispr->n; i++) {
+        waits[i] = dispr->entries[i].wait;
+    }
+    rc = WaitForMultipleObjects(dispr->n, waits, FALSE, timeout / 1000);
+    if (rc == WAIT_TIMEOUT) {
+        if (getenv("VUBR_DEBUG_WAKE")) {
+            for (i = 0; i < dispr->n; i++) {
+                fprintf(stderr, "  idle: fd %d handle %p state %lu\n",
+                        dispr->entries[i].fd, waits[i],
+                        WaitForSingleObject(waits[i], 0));
+            }
+        }
+        return 0;
+    }
+    if (rc >= WAIT_OBJECT_0 + dispr->n) {
+        vubr_die("WaitForMultipleObjects");
+    }
+    i = rc - WAIT_OBJECT_0;
+    fd = dispr->entries[i].fd;
+    if (getenv("VUBR_DEBUG_WAKE")) {
+        fprintf(stderr, "woke on %d (%d entries)\n", fd, dispr->n);
+    }
+    if (dispr->entries[i].socket) {
+        WSANETWORKEVENTS ne;
+
+        char c;
+
+        /* clears the event; FD_READ comes again while data is left */
+        WSAEnumNetworkEvents((SOCKET)_get_osfhandle(fd),
+                             dispr->entries[i].wait, &ne);
+        /*
+         * An FD_READ recorded while a message was half read stays set
+         * after the rest was read: there may be nothing left, and the
+         * callbacks read in blocking mode (the socket is non-blocking
+         * since WSAEventSelect(): the peek does not wait)
+         */
+        if (!(ne.lNetworkEvents & (FD_ACCEPT | FD_CLOSE))) {
+            fd_set rd;
+            struct timeval zero = { 0, 0 };
+
+            FD_ZERO(&rd);
+            FD_SET((SOCKET)_get_osfhandle(fd), &rd);
+            (void)c;
+            if (select(0, &rd, NULL, NULL, &zero) <= 0) {
+                return 0;
+            }
+        }
+    }
+    dispr->entries[i].event.callback(fd, dispr->entries[i].event.ctx);
+    return 0;
+}
+#else
 static int
 dispatcher_init(Dispatcher *dispr)
 {
@@ -168,6 +305,7 @@ dispatcher_wait(Dispatcher *dispr, uint32_t timeout)
 
     return 0;
 }
+#endif
 
 static void
 vubr_handle_tx(VuDev *dev, int qidx)
@@ -210,6 +348,23 @@ vubr_handle_tx(VuDev *dev, int qidx)
             out_sg = sg;
         }
 
+#ifdef _WIN32
+        {
+            WSABUF bufs[VIRTQUEUE_MAX_SIZE];
+            DWORD sent = 0;
+            unsigned int k;
+
+            for (k = 0; k < out_num; k++) {
+                bufs[k].buf = out_sg[k].iov_base;
+                bufs[k].len = out_sg[k].iov_len;
+            }
+            ret = WSASendTo((SOCKET)_get_osfhandle(vubr->backend_udp_sock),
+                            bufs, out_num, &sent, 0,
+                            (struct sockaddr *)&vubr->backend_udp_dest,
+                            sizeof(struct sockaddr_in), NULL, NULL);
+            ret = ret == 0 ? (ssize_t)sent : -1;
+        }
+#else
         struct msghdr msg = {
             .msg_name = (struct sockaddr *) &vubr->backend_udp_dest,
             .msg_namelen = sizeof(struct sockaddr_in),
@@ -219,6 +374,7 @@ vubr_handle_tx(VuDev *dev, int qidx)
         do {
             ret = sendmsg(vubr->backend_udp_sock, &msg, 0);
         } while (ret == -1 && (errno == EAGAIN || errno == EINTR));
+#endif
 
         if (ret == -1) {
             vubr_die("sendmsg()");
@@ -327,6 +483,28 @@ vubr_backend_recv_cb(int sock, void *ctx)
             assert(ret == hdrlen);
         }
 
+#ifdef _WIN32
+        {
+            WSABUF bufs[VIRTQUEUE_MAX_SIZE];
+            DWORD got = 0, flags = 0;
+            unsigned int k;
+
+            for (k = 0; k < num; k++) {
+                bufs[k].buf = sg[k].iov_base;
+                bufs[k].len = sg[k].iov_len;
+            }
+            ret = WSARecvFrom((SOCKET)_get_osfhandle(vubr->backend_udp_sock),
+                              bufs, num, &got, &flags, NULL, NULL, NULL,
+                              NULL);
+            if (ret == 0) {
+                ret = got;
+            } else {
+                errno = WSAGetLastError() == WSAEWOULDBLOCK ? EWOULDBLOCK :
+                        EIO;
+                ret = -1;
+            }
+        }
+#else
         struct msghdr msg = {
             .msg_name = (struct sockaddr *) &vubr->backend_udp_dest,
             .msg_namelen = sizeof(struct sockaddr_in),
@@ -335,6 +513,7 @@ vubr_backend_recv_cb(int sock, void *ctx)
             .msg_flags = MSG_DONTWAIT,
         };
         ret = RETRY_ON_EINTR(recvmsg(vubr->backend_udp_sock, &msg, 0));
+#endif
 
         if (ret > 0 && VHOST_USER_BRIDGE_DEBUG) {
             iov_hexdump(sg, num, stderr, "RX:", ret);
@@ -405,8 +584,12 @@ vubr_set_watch(VuDev *dev, int fd, int condition,
                vu_watch_cb cb, void *data)
 {
     VubrDev *vubr = container_of(dev, VubrDev, vudev);
+#ifdef _WIN32
+    struct WatchData *wd = g_new0(WatchData, 1);   /* few, kept */
+#else
     static WatchData watches[FD_SETSIZE];
     struct WatchData *wd = &watches[fd];
+#endif
 
     wd->cb = cb;
     wd->data = data;
@@ -648,7 +831,11 @@ vubr_host_notifier_setup(VubrDev *dev)
         vubr_die("mkstemp()");
     }
 
+#ifdef _WIN32
+    if (ftruncate(fd, length) != 0) {
+#else
     if (posix_fallocate(fd, 0, length) != 0) {
+#endif
         vubr_die("posix_fallocate()");
     }
 
@@ -672,7 +859,7 @@ static void
 vubr_set_host(struct sockaddr_in *saddr, const char *host)
 {
     if (qemu_isdigit(host[0])) {
-        if (!inet_aton(host, &saddr->sin_addr)) {
+        if (inet_pton(AF_INET, host, &saddr->sin_addr) != 1) {
             fprintf(stderr, "inet_aton() failed.\n");
             exit(1);
         }
@@ -781,6 +968,11 @@ main(int argc, char *argv[])
     int opt;
     bool client = false;
     bool host_notifier = false;
+
+#ifdef _WIN32
+    /* Winsock */
+    socket_init();
+#endif
 
     while ((opt = getopt(argc, argv, "l:r:u:cH")) != -1) {
 

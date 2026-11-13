@@ -1411,12 +1411,13 @@ static bool tcp_chr_open(Chardev *chr, ChardevBackend *backend, Error **errp)
     }
 
     qemu_chr_set_feature(chr, QEMU_CHAR_FEATURE_RECONNECTABLE);
-#ifndef _WIN32
-    /* TODO SOCKET_ADDRESS_FD where fd has AF_UNIX */
+    /*
+     * TODO SOCKET_ADDRESS_FD where fd has AF_UNIX.  Windows passes handles
+     * once the front end asks for it (qemu_chr_fe_set_handle_passing())
+     */
     if (addr->type == SOCKET_ADDRESS_TYPE_UNIX) {
         qemu_chr_set_feature(chr, QEMU_CHAR_FEATURE_FD_PASS);
     }
-#endif
 
     /*
      * In the chardev-change special-case, we shouldn't register a new yank

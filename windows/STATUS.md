@@ -23,7 +23,8 @@ Windows does not have; what replaces it, if anything).
 | --- | --- |
 | `memory-backend-file`, `-mem-path` (file or directory) | **done**: file mappings (`CreateFileMapping`/`MapViewOfFile`); a directory gets a temporary file deleted on close; offsets in multiples of 64 KiB |
 | `memory-backend-shm`, `memory-backend-ram,share=on`, `-machine aux-ram-share=on` | **done**: temporary delete-on-close file kept in cache |
-| `memory-backend-memfd`, hugetlbfs, `guest-memfd`, `memory-backend-epc` (SGX) | **no** |
+| `memory-backend-memfd` | **done**: a delete-on-close file kept in cache (no seals, no huge pages) |
+| hugetlbfs, `guest-memfd`, `memory-backend-epc` (SGX) | **todo** (large pages need SeLockMemoryPrivilege) / **no** |
 | `discard-data`, discard of file-backed RAM | **todo** |
 
 ## Character devices
@@ -42,7 +43,7 @@ Windows does not have; what replaces it, if anything).
 | image locking (`locking=on|auto`) | **done**: the bytes of file-posix.c, locked with `LockFileEx` past 2^62 (Windows locks are mandatory); `qemu-img info` refuses an image in use, `-U` forces |
 | `aio=native` (linux-aio), `io_uring` | Windows overlapped I/O (`aio=native`) as upstream; IoRing **todo** |
 | FUSE export (`qemu-storage-daemon --export fuse`) | **todo** (WinFsp) |
-| vhost-user-blk export, VDUSE export | **todo** / **no** |
+| vhost-user-blk export | **done** (`qemu-storage-daemon --export type=vhost-user-blk`, with `vhost-user-blk-pci`); VDUSE export **todo** |
 | `host_device`, `host_cdrom` | `\\.\PhysicalDriveN`, `\\.\X:` as upstream |
 
 ## Process
@@ -61,7 +62,7 @@ Windows does not have; what replaces it, if anything).
 | --- | --- |
 | user (slirp), socket, stream, dgram, hubport | same |
 | tap | TAP-Windows adapters (upstream); `vhost=`, `script=`, `helper=`, `fds=` **todo** |
-| vhost-user | **todo** (needs passing handles over AF_UNIX) |
+| vhost-user | **done**: both ends of the AF_UNIX socket frame the stream and duplicate handles into the peer (`util/win32-fdpass.c`, as SCM_RIGHTS would pass descriptors); `contrib/vhost-user-bridge` ported (tested: ping through it) |
 | vhost-net, vhost-vdpa, af-xdp, netmap, passt, l2tpv3, vde | **no** (Linux kernel or Linux-only programs) |
 | `-netdev user,smb=` | **todo** |
 
