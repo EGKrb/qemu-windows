@@ -32,6 +32,7 @@
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-type-infos-common.h"
 #include "migration/blocker.h"
+#include "migration/vmstate.h"
 #include "host-cpu.h"
 #include "accel/accel-cpu-target.h"
 #include <winerror.h>
@@ -514,6 +515,8 @@ static void whpx_set_legacy_fp_registers(CPUState *cpu, WHPXStateLevel level)
     }
 }
 
+static void whpx_set_migration_registers(CPUState *cpu);
+
 void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
 {
     struct whpx_state *whpx = &whpx_global;
@@ -564,6 +567,8 @@ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
      */
     if (level >= WHPX_LEVEL_RESET_STATE) {
         whpx_set_tsc(cpu);
+        /* XSS before the XSAVE area, whose compaction depends on it */
+        whpx_set_migration_registers(cpu);
     }
 
     memset(&vcxt, 0, sizeof(struct whpx_register_set));
@@ -735,6 +740,128 @@ static void whpx_get_xcrs(CPUState *cpu)
     }
 
     cpu_env(cpu)->xcr0 = xcr0.Reg64;
+}
+
+/*
+ * State the hypervisor keeps that a migration needs (machine.c sends it):
+ * the Hyper-V MSRs of the guest, XSS and TSC_AUX.  The synthetic timers
+ * have no register here, so they are not offered (see whpx_accel_init).
+ * The guest OS id goes first: the hypercall page needs it.
+ */
+static const WHV_REGISTER_NAME whpx_hv_register_names[] = {
+    WHvRegisterGuestOsId,
+    WHvX64RegisterHypercall,
+    WHvRegisterVpAssistPage,
+    WHvRegisterReferenceTsc,
+    WHvRegisterScontrol,
+    WHvRegisterSiefp,
+    WHvRegisterSimp,
+    WHvRegisterSint0, WHvRegisterSint1, WHvRegisterSint2, WHvRegisterSint3,
+    WHvRegisterSint4, WHvRegisterSint5, WHvRegisterSint6, WHvRegisterSint7,
+    WHvRegisterSint8, WHvRegisterSint9, WHvRegisterSint10, WHvRegisterSint11,
+    WHvRegisterSint12, WHvRegisterSint13, WHvRegisterSint14, WHvRegisterSint15,
+};
+
+static const WHV_REGISTER_NAME whpx_msr_register_names[] = {
+    WHvX64RegisterXss,
+    WHvX64RegisterTscAux,
+};
+
+static void whpx_get_migration_registers(CPUState *cpu)
+{
+    struct whpx_state *whpx = &whpx_global;
+    CPUX86State *env = cpu_env(cpu);
+    WHV_REGISTER_VALUE hv[RTL_NUMBER_OF(whpx_hv_register_names)];
+    WHV_REGISTER_VALUE msr[RTL_NUMBER_OF(whpx_msr_register_names)];
+    HRESULT hr;
+    int i, idx = 0;
+
+    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+        whpx->partition, cpu->cpu_index, whpx_msr_register_names,
+        RTL_NUMBER_OF(whpx_msr_register_names), msr);
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to get XSS and TSC_AUX, hr=%08lx", hr);
+    } else {
+        env->xss = msr[0].Reg64;
+        env->tsc_aux = msr[1].Reg64;
+    }
+
+    if (!whpx->hyperv_enlightenments_enabled) {
+        return;
+    }
+    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
+        whpx->partition, cpu->cpu_index, whpx_hv_register_names,
+        RTL_NUMBER_OF(whpx_hv_register_names), hv);
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to get Hyper-V registers, hr=%08lx", hr);
+        return;
+    }
+    env->msr_hv_guest_os_id = hv[idx++].Reg64;
+    env->msr_hv_hypercall = hv[idx++].Reg64;
+    env->msr_hv_vapic = hv[idx++].Reg64;
+    env->msr_hv_tsc = hv[idx++].Reg64;
+    env->msr_hv_synic_control = hv[idx++].Reg64;
+    env->msr_hv_synic_evt_page = hv[idx++].Reg64;
+    env->msr_hv_synic_msg_page = hv[idx++].Reg64;
+    for (i = 0; i < HV_SINT_COUNT; i++) {
+        env->msr_hv_synic_sint[i] = hv[idx++].Reg64;
+    }
+}
+
+static void whpx_set_migration_registers(CPUState *cpu)
+{
+    struct whpx_state *whpx = &whpx_global;
+    CPUX86State *env = cpu_env(cpu);
+    WHV_REGISTER_VALUE hv[RTL_NUMBER_OF(whpx_hv_register_names)];
+    WHV_REGISTER_VALUE msr[RTL_NUMBER_OF(whpx_msr_register_names)];
+    HRESULT hr;
+    int i, idx = 0;
+
+    msr[0].Reg64 = env->xss;
+    msr[1].Reg64 = env->tsc_aux;
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx->partition, cpu->cpu_index, whpx_msr_register_names,
+        RTL_NUMBER_OF(whpx_msr_register_names), msr);
+    if (FAILED(hr)) {
+        error_report("WHPX: Failed to set XSS and TSC_AUX, hr=%08lx", hr);
+    }
+
+    if (!whpx->hyperv_enlightenments_enabled) {
+        return;
+    }
+    hv[idx++].Reg64 = env->msr_hv_guest_os_id;
+    hv[idx++].Reg64 = env->msr_hv_hypercall;
+    hv[idx++].Reg64 = env->msr_hv_vapic;
+    hv[idx++].Reg64 = env->msr_hv_tsc;
+    hv[idx++].Reg64 = env->msr_hv_synic_control;
+    hv[idx++].Reg64 = env->msr_hv_synic_evt_page;
+    hv[idx++].Reg64 = env->msr_hv_synic_msg_page;
+    for (i = 0; i < HV_SINT_COUNT; i++) {
+        uint64_t sint = env->msr_hv_synic_sint[i];
+
+        /* after a reset QEMU has 0, an unmasked vector 0 the hypervisor
+         * refuses: its own reset value is masked */
+        if (!(sint & HV_SINT_MASKED) && (sint & 0xff) < 16) {
+            sint = HV_SINT_MASKED;
+        }
+        hv[idx++].Reg64 = sint;
+    }
+    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+        whpx->partition, cpu->cpu_index, whpx_hv_register_names,
+        RTL_NUMBER_OF(whpx_hv_register_names), hv);
+    if (FAILED(hr)) {
+        /* one by one: the others still apply */
+        for (i = 0; i < RTL_NUMBER_OF(whpx_hv_register_names); i++) {
+            hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
+                whpx->partition, cpu->cpu_index, &whpx_hv_register_names[i],
+                1, &hv[i]);
+            if (FAILED(hr)) {
+                warn_report("WHPX: Hyper-V register 0x%x: 0x%" PRIx64
+                            " refused, hr=%08lx", whpx_hv_register_names[i],
+                            hv[i].Reg64, hr);
+            }
+        }
+    }
 }
 
 static void whpx_get_registers_for_vmexit(CPUState *cpu, WHPXStateLevel level)
@@ -1045,6 +1172,8 @@ void whpx_get_registers(CPUState *cpu, WHPXStateLevel level)
     /* Interrupt / Event Registers - Skipped */
 
     assert(idx == RTL_NUMBER_OF(whpx_register_names));
+
+    whpx_get_migration_registers(cpu);
 
     if (whpx_irqchip_in_kernel()) {
         whpx_apic_get(x86_cpu->apic_state);
@@ -2822,8 +2951,6 @@ int whpx_vcpu_run(CPUState *cpu)
  * Vcpu support.
  */
 
-static Error *whpx_migration_blocker;
-
 static void whpx_cpu_update_state(void *opaque, bool running, RunState state)
 {
     CPUX86State *env = opaque;
@@ -2838,7 +2965,6 @@ int whpx_init_vcpu(CPUState *cpu)
     HRESULT hr;
     struct whpx_state *whpx = &whpx_global;
     AccelCPUState *vcpu = NULL;
-    Error *local_error = NULL;
     X86CPU *x86_cpu = X86_CPU(cpu);
     CPUX86State *env = &x86_cpu->env;
     X86XSaveHeader *header;
@@ -2847,20 +2973,11 @@ int whpx_init_vcpu(CPUState *cpu)
     UINT64 freq = 0;
     int ret;
 
-    /* Add migration blockers for all unsupported features of the
-     * Windows Hypervisor Platform
+    /*
+     * No migration blocker: the state of the vCPUs (registers, XSAVE, TSC,
+     * local APIC) is read and written whole, and the RAM is tracked (see
+     * whpx_log_sync).
      */
-    if (whpx_migration_blocker == NULL) {
-        error_setg(&whpx_migration_blocker,
-               "State blocked due to missing dirty memory tracking support,"
-               "And some system register/state save-restore ");
-
-        if (migrate_add_blocker(&whpx_migration_blocker, &local_error) < 0) {
-            error_report_err(local_error);
-            ret = -EINVAL;
-            goto error;
-        }
-    }
 
     vcpu = g_new0(AccelCPUState, 1);
 
@@ -3091,9 +3208,62 @@ void whpx_arch_accel_class_init(ObjectClass *oc)
         "Separate security domain");
 }
 
+static Error *whpx_stimer_migration_blocker;
+
+/*
+ * The partition's reference time (the Hyper-V clock of the guest, and its
+ * TSC page) starts at 0 with a partition: a migrated guest goes on with its
+ * own
+ */
+static int whpx_reference_time_pre_save(void *opaque)
+{
+    struct whpx_state *whpx = opaque;
+    HRESULT hr;
+
+    whpx->reference_time = 0;
+    hr = whp_dispatch.WHvGetPartitionProperty(
+        whpx->partition, WHvPartitionPropertyCodeReferenceTime,
+        &whpx->reference_time, sizeof(whpx->reference_time), NULL);
+    if (FAILED(hr)) {
+        warn_report("WHPX: cannot read the reference time, hr=%08lx", hr);
+    }
+    return 0;
+}
+
+static int whpx_reference_time_post_load(void *opaque, int version_id)
+{
+    struct whpx_state *whpx = opaque;
+    HRESULT hr;
+
+    if (!whpx->reference_time) {
+        return 0;
+    }
+    hr = whp_dispatch.WHvSetPartitionProperty(
+        whpx->partition, WHvPartitionPropertyCodeReferenceTime,
+        &whpx->reference_time, sizeof(whpx->reference_time));
+    if (FAILED(hr)) {
+        error_report("WHPX: cannot set the reference time, hr=%08lx", hr);
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_whpx_reference_time = {
+    .name = "whpx-reference-time",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = whpx_reference_time_pre_save,
+    .post_load = whpx_reference_time_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(reference_time, struct whpx_state),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 int whpx_accel_init(AccelState *as, MachineState *ms)
 {
     struct whpx_state *whpx;
+    Error *local_error = NULL;
     int ret;
     HRESULT hr;
     WHV_CAPABILITY whpx_cap;
@@ -3108,10 +3278,13 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
 
-    X86MachineState *x86ms = X86_MACHINE(ms);
+    /* not an x86 machine with -machine none, as when libvirt probes QEMU */
+    X86MachineState *x86ms = (X86MachineState *)
+        object_dynamic_cast(OBJECT(ms), TYPE_X86_MACHINE);
     bool pic_enabled = false;
 
-    if (x86ms->pic == ON_OFF_AUTO_ON || x86ms->pic == ON_OFF_AUTO_AUTO) {
+    if (x86ms &&
+        (x86ms->pic == ON_OFF_AUTO_ON || x86ms->pic == ON_OFF_AUTO_AUTO)) {
         pic_enabled = true;
     }
 
@@ -3368,11 +3541,27 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
 
     if (whpx_irqchip_in_kernel()) {
         synthetic_features.Bank0.AccessSynicRegs = 1;
-        synthetic_features.Bank0.AccessSyntheticTimerRegs = 1;
         synthetic_features.Bank0.AccessIntrCtrlRegs = 1;
         synthetic_features.Bank0.SyntheticClusterIpi = 1;
-        synthetic_features.Bank0.DirectSyntheticTimers = 1;
         synthetic_features.Bank0.AccessGuestIdleReg = 1;
+        /*
+         * The state of the synthetic timers cannot be read or written
+         * through this API: guests use the local APIC timer instead,
+         * which migrates, unless QEMU_WHPX_SYNTHETIC_TIMERS asks for them
+         */
+        if (getenv("QEMU_WHPX_SYNTHETIC_TIMERS")) {
+            synthetic_features.Bank0.AccessSyntheticTimerRegs = 1;
+            synthetic_features.Bank0.DirectSyntheticTimers = 1;
+            error_setg(&whpx_stimer_migration_blocker,
+                       "WHPX: the state of the Hyper-V synthetic timers "
+                       "cannot be saved");
+            if (migrate_add_blocker(&whpx_stimer_migration_blocker,
+                                    &local_error) < 0) {
+                error_report_err(local_error);
+                ret = -EINVAL;
+                goto error;
+            }
+        }
         /*
          * These technically work without the Hyper-V LAPIC
          * but behave oddly for multi-core VMs.
@@ -3459,6 +3648,7 @@ int whpx_accel_init(AccelState *as, MachineState *ms)
 
     whpx_memory_init();
     whpx_init_emu();
+    vmstate_register(NULL, 0, &vmstate_whpx_reference_time, whpx);
 
     as->gdbstub.sstep_flags = SSTEP_ENABLE;
 

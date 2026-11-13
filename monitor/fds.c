@@ -243,10 +243,15 @@ void qmp_get_win32_socket(const char *infos, const char *fdname, Error **errp)
         return;
     }
 
+    /*
+     * Overlapped, as socket() makes them: without it Windows serializes the
+     * I/O of the handle, and a blocking recv() (the return path of a
+     * migration) holds a send() on the same socket forever
+     */
     sk = WSASocketW(FROM_PROTOCOL_INFO,
                     FROM_PROTOCOL_INFO,
                     FROM_PROTOCOL_INFO,
-                    info, 0, 0);
+                    info, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
     if (sk == INVALID_SOCKET) {
         error_setg_win32(errp, WSAGetLastError(), "Couldn't import socket");
         return;

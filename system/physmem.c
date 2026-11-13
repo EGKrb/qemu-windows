@@ -4245,6 +4245,31 @@ int ram_block_discard_shared_range(RAMBlock *rb, uint64_t offset, size_t length)
                              __func__, rb->idstr, offset, length, ret);
                 goto err;
             }
+#elif defined(_WIN32)
+            /*
+             * No madvise() on Windows: decommitting the pages gives them
+             * back to the host, and committing them again makes them read
+             * as zero when next touched, as MADV_DONTNEED does for the
+             * anonymous memory of qemu_anon_ram_alloc().
+             */
+            if (rb->fd >= 0 || qemu_ram_is_shared(rb)) {
+                ret = -ENOTSUP;
+                error_report("%s: cannot discard shared memory %s:%" PRIx64
+                             " +%zx on Windows", __func__, rb->idstr, offset,
+                             length);
+                goto err;
+            }
+            if (!VirtualFree(host_startaddr, length, MEM_DECOMMIT) ||
+                !VirtualAlloc(host_startaddr, length, MEM_COMMIT,
+                              PAGE_READWRITE)) {
+                ret = -EINVAL;
+                error_report("%s: Failed to discard range "
+                             "%s:%" PRIx64 " +%zx (Windows error %lu)",
+                             __func__, rb->idstr, offset, length,
+                             GetLastError());
+                goto err;
+            }
+            ret = 0;
 #else
             ret = -ENOSYS;
             error_report("%s: MADVISE not available %s:%" PRIx64 " +%zx (%d)",

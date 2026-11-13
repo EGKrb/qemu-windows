@@ -13,6 +13,7 @@
 #include "qemu/accel.h"
 #include "accel/accel-ops.h"
 #include "system/memory.h"
+#include "system/physmem.h"
 #include "system/whpx.h"
 #include "system/cpus.h"
 #include "system/runstate.h"
@@ -326,6 +327,18 @@ static void whpx_set_phys_mem(MemoryRegionSection *section, bool add)
      | (writable ? WHvMapGpaRangeFlagWrite : 0);
     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
 
+    /* the pages the guest writes, for migration (see whpx_log_sync) */
+    if (writable && memory_region_is_ram(area) && whpx->dirty_tracking) {
+        hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gva, size,
+                                         flags | WHvMapGpaRangeFlagTrackDirtyPages);
+        if (SUCCEEDED(hr)) {
+            return;
+        }
+        warn_report("WHPX: no dirty page tracking (hr=%08lx): migration "
+                    "sends the whole RAM at each pass", hr);
+        whpx->dirty_tracking = false;
+    }
+
     hr = whp_dispatch.WHvMapGpaRange(whpx->partition,
          mem, gva, size, flags);
     if (FAILED(hr)) {
@@ -357,13 +370,40 @@ static void whpx_transaction_commit(MemoryListener *listener)
 static void whpx_log_sync(MemoryListener *listener,
                          MemoryRegionSection *section)
 {
+    struct whpx_state *whpx = &whpx_global;
     MemoryRegion *mr = section->mr;
+    uint64_t page_size = qemu_real_host_page_size();
+    uint64_t gpa = section->offset_within_address_space;
+    uint64_t size = int128_get64(section->size);
+    uint64_t pages = size / page_size;
+    g_autofree uint64_t *bitmap = NULL;
+    size_t bitmap_len;
+    HRESULT hr;
 
     if (!memory_region_is_ram(mr)) {
         return;
     }
 
-    memory_region_set_dirty(mr, 0, int128_get64(section->size));
+    /*
+     * The pages the guest wrote since the last query, which clears them;
+     * QEMU marks those it writes itself.  Without tracking, all of them.
+     */
+    if (whpx->dirty_tracking && !mr->readonly && !mr->rom_device &&
+        QEMU_IS_ALIGNED(size, page_size) && QEMU_IS_ALIGNED(gpa, page_size)) {
+        bitmap_len = ROUND_UP(pages, 64) / 8;
+        bitmap = g_malloc0(bitmap_len);
+        hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
+                                                      size, bitmap, bitmap_len);
+        if (SUCCEEDED(hr)) {
+            physical_memory_set_dirty_lebitmap((unsigned long *)bitmap,
+                memory_region_get_ram_addr(mr) + section->offset_within_region,
+                pages);
+            return;
+        }
+        warn_report_once("WHPX: cannot query dirty pages (hr=%08lx)", hr);
+    }
+
+    memory_region_set_dirty(mr, section->offset_within_region, size);
 }
 
 static MemoryListener whpx_memory_listener = {
@@ -378,6 +418,8 @@ static MemoryListener whpx_memory_listener = {
 
 void whpx_memory_init(void)
 {
+    whpx_global.dirty_tracking = whp_dispatch.WHvQueryGpaRangeDirtyBitmap != NULL &&
+                                 !getenv("QEMU_WHPX_NO_DIRTY_TRACKING");
     memory_listener_register(&whpx_memory_listener, &address_space_memory);
 }
 

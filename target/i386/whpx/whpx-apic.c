@@ -206,11 +206,48 @@ static void whpx_apic_put(CPUState *cs, run_on_cpu_data data)
     whpx_put_apic_base(CPU(s->cpu), s->apicbase);
     whpx_put_apic_state(s, &kapic);
 
+    /* x2APIC: the LDR is read-only (derived from the APIC id), the DFR gone */
+    if (s->apicbase & MSR_IA32_APICBASE_EXTD) {
+        struct whpx_lapic_state cur;
+
+        if (SUCCEEDED(whp_dispatch.WHvGetVirtualProcessorInterruptControllerState2(
+                whpx_global.partition, cs->cpu_index, &cur, sizeof(cur), NULL))) {
+            kapic.fields[0xd].data = cur.fields[0xd].data;
+            kapic.fields[0xe].data = cur.fields[0xe].data;
+        }
+    }
+
     hr = whp_dispatch.WHvSetVirtualProcessorInterruptControllerState2(
         whpx_global.partition,
         cs->cpu_index,
         &kapic,
         sizeof(kapic));
+    if (FAILED(hr)) {
+        /*
+         * The hypervisor refuses some value (after a migration): the
+         * registers one by one over its current state, keeping those it
+         * takes
+         */
+        struct whpx_lapic_state cur;
+        int i;
+
+        hr = whp_dispatch.WHvGetVirtualProcessorInterruptControllerState2(
+            whpx_global.partition, cs->cpu_index, &cur, sizeof(cur), NULL);
+        for (i = 0; SUCCEEDED(hr) && i < 256; i++) {
+            uint32_t old = cur.fields[i].data;
+
+            if (old == kapic.fields[i].data) {
+                continue;
+            }
+            cur.fields[i].data = kapic.fields[i].data;
+            if (FAILED(whp_dispatch.WHvSetVirtualProcessorInterruptControllerState2(
+                    whpx_global.partition, cs->cpu_index, &cur, sizeof(cur)))) {
+                warn_report("WHPX: local APIC register 0x%x: 0x%x refused, "
+                            "0x%x kept", i * 16, kapic.fields[i].data, old);
+                cur.fields[i].data = old;
+            }
+        }
+    }
     if (FAILED(hr)) {
         fprintf(stderr,
             "WHvSetVirtualProcessorInterruptControllerState failed: %08lx\n",

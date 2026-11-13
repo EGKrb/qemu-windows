@@ -30,7 +30,8 @@ for source, dest in json.loads(out).items():
     except BaseException as e:
         if not isinstance(e, OSError) or e.errno != errno.EEXIST:
             if os.name == 'nt':
-                print('Please enable Developer Mode to support soft link '
-                      'without Administrator permission')
+                # Local Windows build: qemu-bundle is optional, use "ninja install"
+                print('Skipping qemu-bundle (no symlink privilege)', file=sys.stderr)
+                sys.exit(0)
             print(f'error making symbolic link {dest}', file=sys.stderr)
             raise e

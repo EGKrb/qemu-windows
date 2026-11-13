@@ -223,6 +223,16 @@ static int qio_channel_file_set_blocking(QIOChannel *ioc,
                                          Error **errp)
 {
 #ifdef WIN32
+    QIOChannelFile *fioc = QIO_CHANNEL_FILE(ioc);
+    HANDLE h = (HANDLE)_get_osfhandle(fioc->fd);
+
+    /*
+     * Like O_NONBLOCK on POSIX, the blocking mode has no effect on
+     * regular files: I/O on them is always synchronous.
+     */
+    if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_DISK) {
+        return 0;
+    }
     /* not implemented */
     error_setg_errno(errp, errno, "Failed to set FD nonblocking");
     return -1;

@@ -51,6 +51,12 @@ struct whpx_state {
 
     bool ignore_unknown_msr;
     bool intercept_msr_gp;
+
+    /* RAM is mapped with WHvMapGpaRangeFlagTrackDirtyPages */
+    bool dirty_tracking;
+
+    /* the partition's reference time, migrated */
+    uint64_t reference_time;
 };
 
 extern struct whpx_state whpx_global;
@@ -119,6 +125,9 @@ void whpx_apic_get(APICCommonState *s);
         (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, \
         WHV_VIRTUAL_PROCESSOR_STATE_TYPE StateType, PVOID Buffer, \
         UINT32 BufferSizeInBytes)) \
+  X(HRESULT, WHvQueryGpaRangeDirtyBitmap, \
+        (WHV_PARTITION_HANDLE Partition, WHV_GUEST_PHYSICAL_ADDRESS GuestAddress, \
+        UINT64 RangeSizeInBytes, UINT64 *Bitmap, UINT32 BitmapSizeInBytes)) \
   LIST_WINHVPLATFORM_FUNCTIONS_SUPPLEMENTAL_ARCH(X)
 
 #define WHP_DEFINE_TYPE(return_type, function_name, signature) \

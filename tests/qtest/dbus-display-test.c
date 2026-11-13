@@ -208,6 +208,7 @@ test_dbus_console_setup_listener(TestDBusConsoleRegister *test, bool with_map)
     if (with_map) {
 #ifdef WIN32
         g_test_skip("map test lacking on win32");
+        g_main_loop_quit(test->loop);
         return;
 #else
         g_autoptr(QemuDBusDisplay1ListenerUnixMapSkeleton) iface_map =
@@ -308,10 +309,11 @@ test_dbus_console_register(QTestState *qts, GDBusConnection *conn,
         g_error("WSADuplicateSocket failed: %s", emsg);
     }
     close(pair[1]);
-    listener = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
-                                         &info,
-                                         sizeof(info),
-                                         1);
+    /* the call consumes the floating ref: own one for g_autoptr */
+    listener = g_variant_ref_sink(g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+                                                            &info,
+                                                            sizeof(info),
+                                                            1));
 #endif
 
     qemu_dbus_display1_console_call_register_listener(

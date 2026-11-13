@@ -310,6 +310,10 @@ bool qemu_has_direct_io(void)
 static int qemu_open_cloexec(const char *name, int flags, mode_t mode)
 {
     int ret;
+#ifdef _WIN32
+    /* No newline translation: same byte-for-byte I/O as on POSIX */
+    flags |= O_BINARY;
+#endif
 #ifdef O_CLOEXEC
     ret = open(name, flags | O_CLOEXEC, mode);
 #else

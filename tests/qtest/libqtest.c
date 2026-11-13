@@ -152,6 +152,17 @@ static int qtest_socket_accept(QTestState *s, int sock)
     if (ret == -1) {
         fprintf(stderr, "%s failed: %s\n", __func__, strerror(errno));
     }
+#ifdef _WIN32
+    /*
+     * Winsock accepted sockets inherit SO_RCVTIMEO from the listening
+     * socket: drop it, the timeout is only meant for accept().
+     */
+    if (ret != -1) {
+        DWORD no_timeout = 0;
+        setsockopt(ret, SOL_SOCKET, SO_RCVTIMEO,
+                   (void *)&no_timeout, sizeof(no_timeout));
+    }
+#endif
 
     return ret;
 }
