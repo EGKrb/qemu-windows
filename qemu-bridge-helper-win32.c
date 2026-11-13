@@ -381,9 +381,11 @@ cleanup:
         error_report_err(err);
         err = NULL;
     }
+    dbg("out of the bridge");
     if (guid && !tap_win32_adapter_remove(guid, &err)) {
         error_report_err(err);
     }
+    dbg("adapter removed: done");
     w32fd_state_free(&st);
     return ret;
 }
