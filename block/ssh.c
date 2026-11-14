@@ -106,6 +106,13 @@ static void ssh_state_free(BDRVSSHState *s)
         ssh_disconnect(s->session);
         ssh_free(s->session); /* This frees s->sock */
     }
+#ifdef _WIN32
+    /* only the duplicate of libssh: the descriptor is ours */
+    if (s->sock >= 0) {
+        close(s->sock);
+        s->sock = -1;
+    }
+#endif
 }
 
 static void G_GNUC_PRINTF(3, 4)
@@ -745,7 +752,27 @@ static int connect_to_ssh(BDRVSSHState *s, BlockdevOptionsSsh *opts,
         goto err;
     }
 
+#ifdef _WIN32
+    {
+        /*
+         * libssh works with a socket (SOCKET), the event loop with the
+         * descriptor: libssh gets a duplicate, and closes it
+         */
+        HANDLE dup = NULL;
+        socket_t lsock;
+
+        DuplicateHandle(GetCurrentProcess(),
+                        (HANDLE)_get_osfhandle(new_sock), GetCurrentProcess(),
+                        &dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        lsock = (socket_t)dup;
+        r = dup ? ssh_options_set(s->session, SSH_OPTIONS_FD, &lsock) : -1;
+        if (r < 0 && dup) {
+            CloseHandle(dup);
+        }
+    }
+#else
     r = ssh_options_set(s->session, SSH_OPTIONS_FD, &new_sock);
+#endif
     if (r < 0) {
         ret = -EINVAL;
         session_error_setg(errp, s,
@@ -830,6 +857,11 @@ static int connect_to_ssh(BDRVSSHState *s, BlockdevOptionsSsh *opts,
         ssh_free(s->session);
     }
     s->session = NULL;
+#ifdef _WIN32
+    if (s->sock >= 0) {
+        close(s->sock);
+    }
+#endif
     s->sock = -1;
     if (new_sock >= 0) {
         close(new_sock);

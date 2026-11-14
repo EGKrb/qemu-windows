@@ -260,8 +260,6 @@ have_ga = get_option('guest_agent') \
 have_block = have_system or have_tools
 
 enable_modules = get_option('modules') \
-  .require(host_os != 'windows',
-           error_message: 'Modules are not available for Windows') \
   .require(not get_option('prefer_static'),
            error_message: 'Modules are incompatible with static linking') \
   .allowed()
@@ -1303,7 +1301,8 @@ if not get_option('slirp').auto() or have_system
 endif
 
 enable_passt = get_option('passt') \
-  .require(host_os == 'linux', error_message: 'passt is supported only on Linux') \
+  .require(host_os in ['linux', 'windows'],
+           error_message: 'passt is supported only on Linux and Windows') \
   .require(gio.found(), error_message: 'passt requires gio') \
   .allowed()
 
@@ -3932,6 +3931,7 @@ qemu_syms = []
 block_mods = []
 system_mods = []
 emulator_modules = []
+win32_modules = []
 foreach d, list : modules
   if not (d == 'block' ? have_block : have_system)
     continue
@@ -3948,12 +3948,18 @@ foreach d, list : modules
       else
         system_mods += sl
       endif
-      emulator_modules += shared_module(sl.name(),
+      if host_os == 'windows'
+        # linked once the executables are: see win32_modules below
+        win32_modules += [[sl.name(), sl.extract_all_objects(recursive: false),
+                           module_ss.dependencies()]]
+      else
+        emulator_modules += shared_module(sl.name(),
                     name_prefix: '',
                     objects: sl.extract_all_objects(recursive: false),
                     dependencies: module_ss.dependencies(),
                     install: true,
                     install_dir: qemu_moddir)
+      endif
       if module_ss.sources() != []
         modinfo = custom_target(d + '-' + m + '.modinfo',
                                 output: d + '-' + m + '.modinfo',
@@ -3998,12 +4004,18 @@ foreach d, list : target_modules
                                 c_args: c_args,
                                 pic: true)
             system_mods += sl
-            emulator_modules += shared_module(sl.name(),
+            if host_os == 'windows'
+              win32_modules += [[sl.name(),
+                                 sl.extract_all_objects(recursive: false),
+                                 target_module_ss.dependencies()]]
+            else
+              emulator_modules += shared_module(sl.name(),
                     name_prefix: '',
                     objects: sl.extract_all_objects(recursive: false),
                     dependencies: target_module_ss.dependencies(),
                     install: true,
                     install_dir: qemu_moddir)
+            endif
             modinfo_files += custom_target(module_name + '.modinfo',
                                            output: module_name + '.modinfo',
                                            input: sl.extract_all_objects(recursive: true),
@@ -4043,6 +4055,11 @@ if enable_modules
 
   if emulator_modules.length() > 0
     alias_target('modules', emulator_modules)
+  endif
+
+  if host_os == 'windows'
+    # the executables export their symbols, for the modules
+    emulator_link_args += ['-Wl,--export-all-symbols']
   endif
 
   nm = find_program('nm')
@@ -4594,6 +4611,9 @@ endif
 
 if have_tools
   tools_link_args = enable_modules ? ['@block.syms'] : []
+  if enable_modules and host_os == 'windows'
+    tools_link_args += ['-Wl,--export-all-symbols']
+  endif
   qemu_img = executable('qemu-img', [files('qemu-img.c'), hxdep],
              link_args: tools_link_args, link_depends: block_syms,
              dependencies: [authz, block, crypto, io, qom, qemuutil], install: true)
@@ -4677,6 +4697,48 @@ if have_tools
 
   if have_qemu_vnc
     subdir('tools/qemu-vnc')
+  endif
+endif
+
+# passt for Windows (contrib/passt-win32): passt is Linux only
+if enable_passt and host_os == 'windows' and slirp.found() and have_vhost_user
+  subdir('contrib/passt-win32')
+endif
+
+# Modules on Windows: a DLL resolves its imports when it is linked, but the
+# symbols of QEMU a module uses are in the executable that loads it, and
+# several executables load the same modules.  The modules import them from
+# "qemu-host.exe" with a delay-load import library (the Windows loader leaves
+# them alone); the entry point of the module binds them to the executable
+# that loads it, and to the modules loaded before (module-common.c,
+# util/module.c), as the dynamic linker does on Linux.
+if enable_modules and host_os == 'windows'
+  win32_module_hosts = emulators.values()
+  if have_tools
+    win32_module_hosts += [qemu_img, qemu_io, qemu_nbd, qsd]
+  endif
+  win32_module_imports = custom_target('qemu-host-imports',
+      output: ['qemu-host.def', 'libqemu-host.a'],
+      input: [win32_module_hosts, block_mods, system_mods],
+      command: [find_program('scripts/win32-module-imports.py'),
+                find_program('nm'), find_program('objdump'),
+                find_program('dlltool'),
+                '@OUTPUT0@', '@OUTPUT1@', '@INPUT@'])
+  foreach m : win32_modules
+    emulator_modules += shared_module(m[0],
+                    name_prefix: '',
+                    objects: m[1],
+                    # what Linux modules take from the executable
+                    dependencies: m[2] + [glib, socket, pixman, zlib],
+                    link_args: [win32_module_imports[1].full_path(),
+                                '-Wl,-e,qemu_module_entry',
+                                '-Wl,--export-all-symbols'],
+                    link_depends: win32_module_imports[1],
+                    install: true,
+                    install_dir: qemu_moddir)
+  endforeach
+  if emulator_modules.length() > 0
+    alias_target('modules', emulator_modules)
   endif
 endif
 

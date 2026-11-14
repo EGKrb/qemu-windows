@@ -72,6 +72,13 @@ ssize_t w32fd_recv(SOCKET s, W32FdState *st, const struct iovec *iov,
 void w32fd_state_free(W32FdState *st);
 
 /*
+ * The process at the other end of @s, for a socket the other end of which
+ * was passed to a process (a socket pair made here, its other end
+ * inherited): AF_UNIX tells the process that made that end.  0 forgets it.
+ */
+void w32fd_set_peer_pid(SOCKET s, DWORD pid);
+
+/*
  * Descriptors of the C runtime stand for files and sockets; other kernel
  * objects (events) travel as negative "descriptors" that hold a handle.
  */

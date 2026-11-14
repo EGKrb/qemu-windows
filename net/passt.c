@@ -19,6 +19,24 @@
 #include "hw/virtio/vhost-user.h"
 #include "standard-headers/linux/virtio_net.h"
 #include "stream_data.h"
+#include "qemu/sockets.h"
+#ifdef _WIN32
+#include "qemu/win32-fdpass.h"
+#endif
+
+#ifdef _WIN32
+/* passt runs in the background: its PID is all we know of it */
+static void passt_kill(pid_t pid)
+{
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+
+    if (h) {
+        TerminateProcess(h, 0);
+        CloseHandle(h);
+    }
+}
+#define kill(pid, sig) passt_kill(pid)
+#endif
 
 #ifdef CONFIG_VHOST_USER
 static const int user_feature_bits[] = {
@@ -236,10 +254,125 @@ static void net_passt_client_connected(QIOTask *task, gpointer opaque)
     NetPasstState *s = opaque;
 
     if (net_stream_data_client_connected(task, &s->data) == 0) {
-        qemu_set_info_str(&s->data.nc, "stream,connected to pid %d", s->pid);
+        qemu_set_info_str(&s->data.nc, "stream,connected to pid %d", (int)s->pid);
     }
 }
 
+#ifdef _WIN32
+/*
+ * Windows: passt gets the socket by inheritance, its handle in --fd (fd 3
+ * on Linux); it exits once its background process runs, with the PID of
+ * that one in the PID file, as passt does after fork()
+ */
+static int net_passt_start_daemon(NetPasstState *s, int sock, Error **errp)
+{
+    HANDLE child_sock = (HANDLE)_get_osfhandle(sock);
+    STARTUPINFOEXW si = { 0 };
+    PROCESS_INFORMATION pi;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    SIZE_T attrs_size = 0;
+    HANDLE inherit[2];
+    HANDLE child_err = NULL;
+    g_autofree gunichar2 *wcmd = NULL;
+    g_autofree gchar *contents = NULL;
+    g_autoptr(GError) error = NULL;
+    GString *cmd = g_string_new(NULL);
+    DWORD code = 1;
+    int i, ninherit = 0, ret = -1;
+
+    qemu_set_info_str(&s->data.nc, "launching passt");
+
+    /* passt has this end: closing ours must leave the connection alone */
+    qemu_socket_mark_shared(sock);
+    SetHandleInformation(child_sock, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    for (i = 0; i < s->args->len && g_ptr_array_index(s->args, i); i++) {
+        const char *a = g_ptr_array_index(s->args, i);
+        g_autofree char *quoted = NULL;
+
+        if (i > 0 && !strcmp(g_ptr_array_index(s->args, i - 1), "--fd")) {
+            g_string_append_printf(cmd, " %llu",
+                                   (unsigned long long)(uintptr_t)child_sock);
+            continue;
+        }
+        if (*a && !strpbrk(a, " \t\"")) {
+            quoted = g_strdup(a);
+        } else {
+            GString *q = g_string_new("\"");
+            const char *p;
+
+            for (p = a; *p; p++) {
+                if (*p == '"') {
+                    g_string_append_c(q, '\\');
+                }
+                g_string_append_c(q, *p);
+            }
+            g_string_append_c(q, '"');
+            quoted = g_string_free(q, FALSE);
+        }
+        g_string_append_printf(cmd, "%s%s", i ? " " : "", quoted);
+    }
+    wcmd = g_utf8_to_utf16(cmd->str, -1, NULL, NULL, NULL);
+
+    inherit[ninherit++] = child_sock;
+    /* its messages go to our stderr, as on Linux */
+    if (DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE),
+                        GetCurrentProcess(), &child_err, 0, TRUE,
+                        DUPLICATE_SAME_ACCESS)) {
+        inherit[ninherit++] = child_err;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdError = child_err;
+    }
+    si.StartupInfo.cb = sizeof(si);
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrs_size);
+    attrs = g_malloc(attrs_size);
+    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrs_size) ||
+        !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherit, ninherit * sizeof(HANDLE), NULL,
+                                   NULL)) {
+        error_setg_win32(errp, GetLastError(), "Error creating daemon");
+        goto out;
+    }
+    si.lpAttributeList = attrs;
+    if (!CreateProcessW(NULL, (wchar_t *)wcmd, NULL, NULL, TRUE,
+                        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                        NULL, NULL, &si.StartupInfo, &pi)) {
+        error_setg_win32(errp, GetLastError(), "Error creating daemon: %s",
+                         cmd->str);
+        goto out;
+    }
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    if (code) {
+        error_setg(errp, "Passt exited with code %lu", (unsigned long)code);
+        goto out;
+    }
+
+    if (!g_file_get_contents(s->pidfile, &contents, NULL, &error)) {
+        error_setg(errp, "Cannot read passt pid: %s", error->message);
+        goto out;
+    }
+    s->pid = (pid_t)g_ascii_strtoll(contents, NULL, 10);
+    if (s->pid <= 0) {
+        error_setg(errp, "File '%s' did not contain a valid PID.", s->pidfile);
+        goto out;
+    }
+    ret = 0;
+
+out:
+    SetHandleInformation(child_sock, HANDLE_FLAG_INHERIT, 0);
+    if (child_err) {
+        CloseHandle(child_err);
+    }
+    if (attrs) {
+        DeleteProcThreadAttributeList(attrs);
+        g_free(attrs);
+    }
+    g_string_free(cmd, TRUE);
+    return ret;
+}
+#else
 static int net_passt_start_daemon(NetPasstState *s, int sock, Error **errp)
 {
     g_autoptr(GSubprocess) daemon = NULL;
@@ -294,6 +427,7 @@ static int net_passt_start_daemon(NetPasstState *s, int sock, Error **errp)
 
     return 0;
 }
+#endif
 
 static int net_passt_stream_start(NetPasstState *s, Error **errp)
 {
@@ -301,7 +435,7 @@ static int net_passt_stream_start(NetPasstState *s, Error **errp)
     SocketAddress *addr;
     int sv[2];
 
-    if (socketpair(PF_UNIX, SOCK_STREAM, 0, sv) == -1) {
+    if (qemu_socketpair(PF_UNIX, SOCK_STREAM, 0, sv) == -1) {
         error_setg_errno(errp, errno, "socketpair() failed");
         return -1;
     }
@@ -439,7 +573,7 @@ static int net_passt_vhost_user_init(NetPasstState *s, Error **errp)
     Chardev *chr;
     int sv[2];
 
-    if (socketpair(PF_UNIX, SOCK_STREAM, 0, sv) == -1) {
+    if (qemu_socketpair(PF_UNIX, SOCK_STREAM, 0, sv) == -1) {
         error_setg_errno(errp, errno, "socketpair() failed");
         return -1;
     }
@@ -466,6 +600,10 @@ static int net_passt_vhost_user_init(NetPasstState *s, Error **errp)
     if (net_passt_start_daemon(s, sv[1], errp) == -1) {
         goto err;
     }
+#ifdef _WIN32
+    /* both ends were made here: the handles we send go to passt */
+    w32fd_set_peer_pid((SOCKET)_get_osfhandle(sv[0]), s->pid);
+#endif
 
     do {
         if (qemu_chr_fe_wait_connected(&s->vhost_chr, errp) < 0) {
@@ -477,7 +615,7 @@ static int net_passt_vhost_user_init(NetPasstState *s, Error **errp)
                                  true);
     } while (!s->started);
 
-    qemu_set_info_str(&s->data.nc, "vhost-user,connected to pid %d", s->pid);
+    qemu_set_info_str(&s->data.nc, "vhost-user,connected to pid %d", (int)s->pid);
 
     close(sv[1]);
     return 0;

@@ -123,15 +123,64 @@ static int recv_all(SOCKET s, void *buf, size_t len)
     return 1;
 }
 
+/* the peers named by w32fd_set_peer_pid() */
+static struct {
+    SOCKET s;
+    DWORD pid;
+} peer_pids[32];
+static SRWLOCK peer_pids_lock = SRWLOCK_INIT;
+
+void w32fd_set_peer_pid(SOCKET s, DWORD pid)
+{
+    int i, free_slot = -1;
+
+    AcquireSRWLockExclusive(&peer_pids_lock);
+    for (i = 0; i < 32; i++) {
+        if (peer_pids[i].s == s && peer_pids[i].pid) {
+            free_slot = i;
+            break;
+        }
+        if (!peer_pids[i].pid && free_slot < 0) {
+            free_slot = i;
+        }
+    }
+    if (free_slot >= 0) {
+        peer_pids[free_slot].s = s;
+        peer_pids[free_slot].pid = pid;
+    }
+    ReleaseSRWLockExclusive(&peer_pids_lock);
+}
+
+static DWORD named_peer_pid(SOCKET s)
+{
+    DWORD pid = 0;
+    int i;
+
+    AcquireSRWLockShared(&peer_pids_lock);
+    for (i = 0; i < 32; i++) {
+        if (peer_pids[i].pid && peer_pids[i].s == s) {
+            pid = peer_pids[i].pid;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&peer_pids_lock);
+    return pid;
+}
+
 static HANDLE peer_process(SOCKET s, W32FdState *st)
 {
-    DWORD pid = 0, bytes = 0;
+    DWORD pid = named_peer_pid(s), bytes = 0;
 
-    if (st->peer_process) {
+    if (st->peer_process && (!pid || pid == st->peer_pid)) {
         return st->peer_process;
     }
-    if (WSAIoctl(s, SIO_AF_UNIX_GETPEERPID, NULL, 0, &pid, sizeof(pid),
-                 &bytes, NULL, NULL) == SOCKET_ERROR || !pid) {
+    if (st->peer_process) {
+        CloseHandle(st->peer_process);
+        st->peer_process = NULL;
+    }
+    if (!pid &&
+        (WSAIoctl(s, SIO_AF_UNIX_GETPEERPID, NULL, 0, &pid, sizeof(pid),
+                  &bytes, NULL, NULL) == SOCKET_ERROR || !pid)) {
         errno = ENOTSUP;
         return NULL;
     }

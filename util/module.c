@@ -145,6 +145,35 @@ static bool module_check_arch(const QemuModinfo *modinfo)
     return true;
 }
 
+#ifdef _WIN32
+/*
+ * Modules on Windows import the symbols of QEMU from "qemu-host.exe", and
+ * their entry point asks this function for each (module-common.c): the
+ * executable exports its symbols, and a module loaded with its symbols
+ * global (another module depends on it) exports its own.  The loader lock
+ * is held here.
+ */
+static GPtrArray *win32_global_modules;
+static char *win32_missing_symbol;
+
+void *qemu_module_resolve(const char *name);
+void *qemu_module_resolve(const char *name)
+{
+    void *p = (void *)GetProcAddress(GetModuleHandleW(NULL), name);
+    guint i;
+
+    for (i = 0; !p && win32_global_modules &&
+                i < win32_global_modules->len; i++) {
+        p = (void *)GetProcAddress(g_ptr_array_index(win32_global_modules, i),
+                                   name);
+    }
+    if (!p && !win32_missing_symbol) {
+        win32_missing_symbol = g_strdup(name);
+    }
+    return p;
+}
+#endif
+
 /*
  * module_load_dso: attempt to load an existing dso file
  *
@@ -168,8 +197,19 @@ static bool module_load_dso(const char *fname, bool export_symbols,
     if (!export_symbols) {
         flags |= G_MODULE_BIND_LOCAL;
     }
+#ifdef _WIN32
+    g_clear_pointer(&win32_missing_symbol, g_free);
+#endif
     g_module = g_module_open(fname, flags);
     if (!g_module) {
+#ifdef _WIN32
+        if (win32_missing_symbol) {
+            error_setg(errp, "failed to open module: %s: undefined symbol: %s",
+                       fname, win32_missing_symbol);
+            g_clear_pointer(&win32_missing_symbol, g_free);
+            return false;
+        }
+#endif
         error_setg(errp, "failed to open module: %s", g_module_error());
         return false;
     }
@@ -186,6 +226,21 @@ static bool module_load_dso(const char *fname, bool export_symbols,
         g_module_close(g_module);
         return false;
     }
+
+#ifdef _WIN32
+    if (export_symbols) {
+        HMODULE h;
+
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)(void *)sym, &h)) {
+            if (!win32_global_modules) {
+                win32_global_modules = g_ptr_array_new();
+            }
+            g_ptr_array_add(win32_global_modules, h);
+        }
+    }
+#endif
 
     QTAILQ_FOREACH(e, &dso_init_list, node) {
         e->init();
@@ -236,6 +291,28 @@ int module_load(const char *prefix, const char *name, Error **errp)
     if (search_dir != NULL) {
         dirs[n_dirs++] = g_strdup(search_dir);
     }
+#ifdef _WIN32
+    /*
+     * In the build tree, qemu-bundle has copies of the modules made when
+     * it was configured (symbolic links on Linux): the ones built next to
+     * the executable come first
+     */
+    {
+        wchar_t self[MAX_PATH];
+        g_autofree char *exe = NULL, *exe_dir = NULL, *bundle = NULL;
+
+        if (GetModuleFileNameW(NULL, self, MAX_PATH)) {
+            exe = g_utf16_to_utf8((gunichar2 *)self, -1, NULL, NULL, NULL);
+        }
+        if (exe) {
+            exe_dir = g_path_get_dirname(exe);
+            bundle = g_build_filename(exe_dir, "qemu-bundle", NULL);
+            if (g_file_test(bundle, G_FILE_TEST_IS_DIR)) {
+                dirs[n_dirs++] = g_steal_pointer(&exe_dir);
+            }
+        }
+    }
+#endif
     dirs[n_dirs++] = get_relocated_path(CONFIG_QEMU_MODDIR);
 
 #ifdef CONFIG_MODULE_UPGRADES

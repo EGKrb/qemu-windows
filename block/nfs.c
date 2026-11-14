@@ -64,7 +64,56 @@ typedef struct NFSClient {
     NFSServer *server;
     char *path;
     int64_t uid, gid, tcp_syncnt, readahead, pagecache, debug;
+#ifdef _WIN32
+    SOCKET win_sock;            /* the socket of libnfs ... */
+    int win_fd1;                /* ... our descriptor of it, plus one */
+#endif
 } NFSClient;
+
+#ifdef _WIN32
+/*
+ * libnfs works with a socket (SOCKET), the event loop of QEMU with
+ * descriptors: a descriptor on a duplicate of the socket of libnfs, made
+ * again when libnfs connects again; -1 without a socket
+ */
+static int nfs_aio_fd(NFSClient *client)
+{
+    SOCKET sock = (SOCKET)nfs_get_fd(client->context);
+
+    if (sock != client->win_sock || !client->win_fd1) {
+        HANDLE dup;
+
+        if (client->win_fd1) {
+            aio_set_fd_handler(client->aio_context, client->win_fd1 - 1,
+                               NULL, NULL, NULL, NULL, NULL);
+            close(client->win_fd1 - 1);
+            client->win_fd1 = 0;
+            client->events = 0;
+        }
+        client->win_sock = sock;
+        if (sock != INVALID_SOCKET && sock &&
+            DuplicateHandle(GetCurrentProcess(), (HANDLE)sock,
+                            GetCurrentProcess(), &dup, 0, FALSE,
+                            DUPLICATE_SAME_ACCESS)) {
+            client->win_fd1 = _open_osfhandle((intptr_t)dup, _O_BINARY) + 1;
+        }
+    }
+    return client->win_fd1 - 1;
+}
+
+static void nfs_aio_unset(NFSClient *client)
+{
+    if (client->win_fd1) {
+        aio_set_fd_handler(client->aio_context, client->win_fd1 - 1,
+                           NULL, NULL, NULL, NULL, NULL);
+    }
+}
+#else
+#define nfs_aio_fd(client) nfs_get_fd((client)->context)
+#define nfs_aio_unset(client) \
+    aio_set_fd_handler((client)->aio_context, nfs_get_fd((client)->context), \
+                       NULL, NULL, NULL, NULL, NULL)
+#endif
 
 typedef struct NFSRPC {
     BlockDriverState *bs;
@@ -191,9 +240,14 @@ static void nfs_process_write(void *arg);
 /* Called with QemuMutex held.  */
 static void nfs_set_events(NFSClient *client)
 {
+    int fd = nfs_aio_fd(client);
     int ev = nfs_which_events(client->context);
+
+    if (fd < 0) {
+        return;
+    }
     if (ev != client->events) {
-        aio_set_fd_handler(client->aio_context, nfs_get_fd(client->context),
+        aio_set_fd_handler(client->aio_context, fd,
                            (ev & POLLIN) ? nfs_process_read : NULL,
                            (ev & POLLOUT) ? nfs_process_write : NULL,
                            NULL, NULL, client);
@@ -403,8 +457,7 @@ static void nfs_detach_aio_context(BlockDriverState *bs)
 {
     NFSClient *client = bs->opaque;
 
-    aio_set_fd_handler(client->aio_context, nfs_get_fd(client->context),
-                       NULL, NULL, NULL, NULL, NULL);
+    nfs_aio_unset(client);
     client->events = 0;
 }
 
@@ -421,8 +474,14 @@ static void nfs_client_close(NFSClient *client)
 {
     if (client->context) {
         qemu_mutex_lock(&client->mutex);
-        aio_set_fd_handler(client->aio_context, nfs_get_fd(client->context),
-                           NULL, NULL, NULL, NULL, NULL);
+        nfs_aio_unset(client);
+#ifdef _WIN32
+        if (client->win_fd1) {
+            close(client->win_fd1 - 1);
+            client->win_fd1 = 0;
+        }
+        client->win_sock = 0;
+#endif
         qemu_mutex_unlock(&client->mutex);
         if (client->fh) {
             nfs_close(client->context, client->fh);

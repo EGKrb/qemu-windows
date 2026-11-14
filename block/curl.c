@@ -34,7 +34,72 @@
 #include "crypto/secret.h"
 #include <curl/curl.h>
 #include "qemu/cutils.h"
+#include "qemu/sockets.h"
 #include "trace.h"
+
+#ifdef _WIN32
+/*
+ * Windows: curl works with sockets (SOCKET), the event loop of QEMU with
+ * descriptors.  curl opens and closes its sockets through these callbacks,
+ * which keep the descriptor of each.
+ */
+static GHashTable *curl_win32_fds;      /* SOCKET -> descriptor + 1 */
+G_LOCK_DEFINE_STATIC(curl_win32_fds);
+
+static curl_socket_t curl_win32_open(void *clientp, curlsocktype purpose,
+                                     struct curl_sockaddr *address)
+{
+    int fd = qemu_socket(address->family, address->socktype,
+                         address->protocol);
+    SOCKET sock;
+
+    if (fd < 0) {
+        return CURL_SOCKET_BAD;
+    }
+    sock = _get_osfhandle(fd);
+    G_LOCK(curl_win32_fds);
+    if (!curl_win32_fds) {
+        curl_win32_fds = g_hash_table_new(NULL, NULL);
+    }
+    g_hash_table_insert(curl_win32_fds, (gpointer)(uintptr_t)sock,
+                        GINT_TO_POINTER(fd + 1));
+    G_UNLOCK(curl_win32_fds);
+    return sock;
+}
+
+static int curl_win32_fd(curl_socket_t sock, bool remove)
+{
+    int fd = 0;
+
+    G_LOCK(curl_win32_fds);
+    if (curl_win32_fds) {
+        fd = GPOINTER_TO_INT(g_hash_table_lookup(curl_win32_fds,
+                                                 (gpointer)(uintptr_t)sock));
+        if (remove) {
+            g_hash_table_remove(curl_win32_fds, (gpointer)(uintptr_t)sock);
+        }
+    }
+    G_UNLOCK(curl_win32_fds);
+    return fd - 1;
+}
+
+static int curl_win32_close(void *clientp, curl_socket_t sock)
+{
+    int fd = curl_win32_fd(sock, true);
+
+    return fd >= 0 ? close(fd) : closesocket(sock);
+}
+
+/* the descriptor of a socket of curl, for the event loop */
+static int curl_aio_fd(curl_socket_t sock)
+{
+    int fd = curl_win32_fd(sock, false);
+
+    return fd >= 0 ? fd : (int)sock;
+}
+#else
+#define curl_aio_fd(sock) (sock)
+#endif
 
 // #define DEBUG_VERBOSE
 
@@ -134,7 +199,7 @@ static gboolean curl_drop_socket(void *key, void *value, void *opaque)
     CURLSocket *socket = value;
     BDRVCURLState *s = socket->s;
 
-    aio_set_fd_handler(s->aio_context, socket->fd,
+    aio_set_fd_handler(s->aio_context, curl_aio_fd(socket->fd),
                        NULL, NULL, NULL, NULL, NULL);
     return true;
 }
@@ -178,20 +243,20 @@ static int curl_sock_cb(CURL *curl, curl_socket_t fd, int action,
     trace_curl_sock_cb(action, (int)fd);
     switch (action) {
         case CURL_POLL_IN:
-            aio_set_fd_handler(s->aio_context, fd,
+            aio_set_fd_handler(s->aio_context, curl_aio_fd(fd),
                                curl_multi_do, NULL, NULL, NULL, socket);
             break;
         case CURL_POLL_OUT:
-            aio_set_fd_handler(s->aio_context, fd,
+            aio_set_fd_handler(s->aio_context, curl_aio_fd(fd),
                                NULL, curl_multi_do, NULL, NULL, socket);
             break;
         case CURL_POLL_INOUT:
-            aio_set_fd_handler(s->aio_context, fd,
+            aio_set_fd_handler(s->aio_context, curl_aio_fd(fd),
                                curl_multi_do, curl_multi_do,
                                NULL, NULL, socket);
             break;
         case CURL_POLL_REMOVE:
-            aio_set_fd_handler(s->aio_context, fd,
+            aio_set_fd_handler(s->aio_context, curl_aio_fd(fd),
                                NULL, NULL, NULL, NULL, NULL);
             break;
     }
@@ -495,6 +560,14 @@ static int curl_init_state(BDRVCURLState *s, CURLState *state)
             curl_easy_setopt(state->curl, CURLOPT_FAILONERROR, 1L)) {
             goto err;
         }
+#ifdef _WIN32
+        if (curl_easy_setopt(state->curl, CURLOPT_OPENSOCKETFUNCTION,
+                             curl_win32_open) ||
+            curl_easy_setopt(state->curl, CURLOPT_CLOSESOCKETFUNCTION,
+                             curl_win32_close)) {
+            goto err;
+        }
+#endif
         if (s->username) {
             if (curl_easy_setopt(state->curl, CURLOPT_USERNAME, s->username)) {
                 goto err;
