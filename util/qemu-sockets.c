@@ -54,6 +54,22 @@
 #endif
 
 
+/*
+ * The backlog of a listening socket.  Linux drops a connection when the
+ * backlog is full and the client tries again: it waits.  Windows refuses
+ * it at once (a QMP client connecting while QEMU starts gets "connection
+ * refused").  So that clients wait on Windows too, its listening sockets
+ * queue as many connections as the system lets them.
+ */
+static int listen_backlog(int num)
+{
+#ifdef _WIN32
+    return SOMAXCONN;
+#else
+    return num;
+#endif
+}
+
 static int inet_getport(struct addrinfo *e)
 {
     struct sockaddr_in *i4;
@@ -379,7 +395,7 @@ static int inet_listen_saddr(InetSocketAddress *saddr,
                 error_setg_errno(errp, errno, "Failed to bind socket");
                 goto fail;
             }
-            if (listen(slisten, num)) {
+            if (listen(slisten, listen_backlog(num))) {
                 if (errno == EADDRINUSE) {
                     /* This port is already used, try the next one */
                     continue;
@@ -876,7 +892,7 @@ static int vsock_listen_saddr(VsockSocketAddress *vaddr,
         return -1;
     }
 
-    if (listen(slisten, num) != 0) {
+    if (listen(slisten, listen_backlog(num)) != 0) {
         error_setg_errno(errp, errno, "Failed to listen on socket");
         close(slisten);
         return -1;
@@ -1026,7 +1042,7 @@ static int unix_listen_saddr(UnixSocketAddress *saddr,
         error_setg_errno(errp, errno, "Failed to bind socket to %s", path);
         goto err;
     }
-    if (listen(sock, num) < 0) {
+    if (listen(sock, listen_backlog(num)) < 0) {
         error_setg_errno(errp, errno, "Failed to listen on socket");
         goto err;
     }
@@ -1294,7 +1310,7 @@ int socket_listen(SocketAddress *addr, int num, Error **errp)
          * If this socket cannot listen because it's already in another state
          * (e.g. unbound or connected) then we'll catch the error here.
          */
-        if (listen(fd, num) != 0) {
+        if (listen(fd, listen_backlog(num)) != 0) {
             error_setg_errno(errp, errno, "Failed to listen on fd socket");
             close(fd);
             return -1;
