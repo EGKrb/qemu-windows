@@ -749,6 +749,8 @@ static void w32fd_from_fd(int fd, W32FdItem *it)
     } else if (fd_is_socket(fd)) {
         it->type = W32FD_SOCKET;
         it->handle = (HANDLE)_get_osfhandle(fd);
+        /* the peer gets this socket too */
+        qemu_socket_mark_shared(fd);
     } else {
         it->type = W32FD_FILE;
         it->handle = (HANDLE)_get_osfhandle(fd);
@@ -766,6 +768,9 @@ static int w32fd_to_fd(W32FdItem *it)
         fd = _open_osfhandle((intptr_t)it->handle, _O_BINARY);
         if (fd < 0) {
             closesocket((SOCKET)it->handle);
+        } else {
+            /* the sender has this socket too */
+            qemu_socket_mark_shared(fd);
         }
         return fd;
     default:

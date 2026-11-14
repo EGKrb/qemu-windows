@@ -855,6 +855,8 @@ static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
         return NULL;
     }
     child_sock = (HANDLE)_get_osfhandle(sv[1]);
+    /* the helper inherits this end: closing ours must leave it alone */
+    qemu_socket_mark_shared(sv[1]);
     SetHandleInformation(child_sock, HANDLE_FLAG_INHERIT,
                          HANDLE_FLAG_INHERIT);
 
@@ -916,7 +918,6 @@ static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
         SOCKET s0 = (SOCKET)_get_osfhandle(sv[0]);
         WSAEVENT ev = WSACreateEvent();
         HANDLE hs[2] = { ev, pi.hProcess };
-        u_long blocking = 0;
         fd_set rfds;
         struct timeval tv = { 0, 0 };
 
@@ -924,7 +925,8 @@ static HANDLE tap_win32_run_helper(const char *helper, const char *bridge,
         WaitForMultipleObjects(2, hs, FALSE, 120 * 1000);
         WSAEventSelect(s0, NULL, 0);
         WSACloseEvent(ev);
-        ioctlsocket(s0, FIONBIO, &blocking);
+        /* the descriptor: ioctlsocket() of QEMU takes one, not a SOCKET */
+        qemu_set_blocking(sv[0], true, NULL);
         FD_ZERO(&rfds);
         FD_SET(s0, &rfds);
         if (select(0, &rfds, NULL, NULL, &tv) != 1) {

@@ -26,6 +26,12 @@
 #include "qapi/error.h"
 #include "net/tap-win32-adapter.h"
 
+/*
+ * os-win32.h makes recv() take a descriptor of the C runtime; the socket
+ * of this helper is a SOCKET: the recv() of Winsock
+ */
+#undef recv
+
 #ifndef SIO_AF_UNIX_GETPEERPID
 #define SIO_AF_UNIX_GETPEERPID _WSAIOR(IOC_VENDOR, 256)
 #endif

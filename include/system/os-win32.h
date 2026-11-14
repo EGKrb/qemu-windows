@@ -202,6 +202,13 @@ void qemu_socket_unselect_nofail(int sockfd);
  */
 int qemu_close_socket_osfhandle(int fd);
 
+/*
+ * A socket shared with another process (handle passing, inheritance):
+ * close() of our copy must leave the connection alone, as on Linux; for
+ * the others close() ends it gracefully (FIN, not a reset)
+ */
+void qemu_socket_mark_shared(int sockfd);
+
 #undef close
 #define close qemu_close_wrap
 int qemu_close_wrap(int fd);

@@ -557,6 +557,88 @@ int qemu_close_socket_osfhandle(int fd)
     return 0;
 }
 
+/*
+ * Sockets still open when QEMU exits.  Linux ends their connections
+ * gracefully when the process exits (FIN): a QMP client reads the end of
+ * the stream after "quit".  Windows resets them (RST): the client gets
+ * "connection reset".  So QEMU closes them itself at exit, as close()
+ * would: shutdown() of sending, then closesocket().
+ */
+static int win32_socket_close(SOCKET s, bool shared);
+static SRWLOCK open_sockets_lock = SRWLOCK_INIT;
+static GArray *open_sockets;    /* of SOCKET */
+
+static void open_sockets_close_all(void)
+{
+    guint i;
+
+    AcquireSRWLockExclusive(&open_sockets_lock);
+    for (i = 0; open_sockets && i < open_sockets->len; i++) {
+        SOCKET s = g_array_index(open_sockets, SOCKET, i);
+
+        win32_socket_close(s, false);
+    }
+    if (open_sockets) {
+        g_array_set_size(open_sockets, 0);
+    }
+    ReleaseSRWLockExclusive(&open_sockets_lock);
+}
+
+static void open_sockets_add(SOCKET s)
+{
+    AcquireSRWLockExclusive(&open_sockets_lock);
+    if (!open_sockets) {
+        open_sockets = g_array_new(FALSE, FALSE, sizeof(SOCKET));
+        atexit(open_sockets_close_all);
+    }
+    g_array_append_val(open_sockets, s);
+    ReleaseSRWLockExclusive(&open_sockets_lock);
+}
+
+/* Sockets shared with another process: no shutdown() when we close ours */
+static GHashTable *shared_sockets;
+
+void qemu_socket_mark_shared(int sockfd)
+{
+    SOCKET s = _get_osfhandle(sockfd);
+
+    if (s == INVALID_SOCKET) {
+        return;
+    }
+    AcquireSRWLockExclusive(&open_sockets_lock);
+    if (!shared_sockets) {
+        shared_sockets = g_hash_table_new(NULL, NULL);
+    }
+    g_hash_table_add(shared_sockets, (gpointer)(uintptr_t)s);
+    ReleaseSRWLockExclusive(&open_sockets_lock);
+}
+
+/* Forget @s; true if it was shared */
+static bool shared_sockets_take(SOCKET s)
+{
+    bool shared;
+
+    AcquireSRWLockExclusive(&open_sockets_lock);
+    shared = shared_sockets &&
+             g_hash_table_remove(shared_sockets, (gpointer)(uintptr_t)s);
+    ReleaseSRWLockExclusive(&open_sockets_lock);
+    return shared;
+}
+
+static void open_sockets_remove(SOCKET s)
+{
+    guint i;
+
+    AcquireSRWLockExclusive(&open_sockets_lock);
+    for (i = 0; open_sockets && i < open_sockets->len; i++) {
+        if (g_array_index(open_sockets, SOCKET, i) == s) {
+            g_array_remove_index_fast(open_sockets, i);
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&open_sockets_lock);
+}
+
 int qemu_close_wrap(int fd)
 {
     SOCKET s = INVALID_SOCKET;
@@ -580,7 +662,8 @@ int qemu_close_wrap(int fd)
     s = _get_osfhandle(fd);
     qemu_close_socket_osfhandle(fd);
 
-    ret = closesocket(s);
+    open_sockets_remove(s);
+    ret = win32_socket_close(s, shared_sockets_take(s));
     if (ret < 0) {
         errno = socket_error();
     }
@@ -606,6 +689,8 @@ int qemu_socket_wrap(int domain, int type, int protocol)
         closesocket(s);
         /* _open_osfhandle may not set errno, and closesocket() may override it */
         errno = ENOMEM;
+    } else {
+        open_sockets_add(s);
     }
 
     return fd;
@@ -634,6 +719,8 @@ int qemu_accept_wrap(int sockfd, struct sockaddr *addr,
         closesocket(s);
         /* _open_osfhandle may not set errno, and closesocket() may override it */
         errno = ENOMEM;
+    } else {
+        open_sockets_add(s);
     }
 
     return fd;
@@ -1025,4 +1112,38 @@ int qemu_ftruncate64(int fd, int64_t length)
     /* back to old position */
     SetFilePointer(h, li.LowPart, &li.HighPart, FILE_BEGIN);
     return res ? 0 : -1;
+}
+
+/*
+ * Close a socket as close() does on Linux: the peer reads the end of the
+ * stream (FIN).  Here, after the #undef of the wrappers above: these are
+ * the functions of Winsock, on a SOCKET.
+ */
+static int win32_socket_close(SOCKET s, bool shared)
+{
+    typedef LONG (NTAPI *QueryObjectFn)(HANDLE, int, PVOID, ULONG, PULONG);
+    static QueryObjectFn query;
+    struct {
+        ULONG attributes, access, handles, pointers, reserved[10];
+    } info;
+    ULONG len;
+
+    /*
+     * shutdown() acts on the socket, not on our handle: for a socket
+     * another process has too (duplicated to it, inherited), it would end
+     * the connection for it.  Marked shared, or more than our handle.
+     */
+    if (!query) {
+        query = (QueryObjectFn)(void *)GetProcAddress(
+            GetModuleHandleW(L"ntdll.dll"), "NtQueryObject");
+    }
+    if (!shared && query &&
+        query((HANDLE)s, 0 /* basic */, &info, sizeof(info), &len) >= 0 &&
+        info.handles > 1) {
+        shared = true;
+    }
+    if (!shared) {
+        shutdown(s, SD_SEND);
+    }
+    return closesocket(s);
 }

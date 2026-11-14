@@ -55,6 +55,9 @@ static void *qemu_default_main(void *opaque)
     replay_mutex_unlock();
 
     qemu_exit_debug("exit()");
+    if (getenv("QEMU_EXIT_SLEEP")) {
+        g_usleep(3 * G_USEC_PER_SEC);
+    }
     exit(status);
 }
 
