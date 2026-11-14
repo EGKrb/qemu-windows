@@ -21,14 +21,22 @@
  *
  * If zero, the host and guest virtual address spaces are intermingled.
  */
+#ifdef _WIN32
+extern uintptr_t reserved_va;       /* unsigned long has 32 bits there */
+#else
 extern unsigned long reserved_va;
+#endif
 
 /*
  * The last byte of the guest address space.
  * If reserved_va is non-zero, guest_addr_max matches.
  * If reserved_va is zero, guest_addr_max equals the full guest space.
  */
+#ifdef _WIN32
+extern uintptr_t guest_addr_max;
+#else
 extern unsigned long guest_addr_max;
+#endif
 
 /*
  * These functions take the guest virtual address as a vaddr,

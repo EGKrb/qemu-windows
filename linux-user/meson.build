@@ -4,6 +4,12 @@ endif
 
 linux_user_ss = ss.source_set()
 
+if host_os == 'windows'
+  # Windows: a frontend of its own (linux-user/win32), on Windows APIs
+  subdir('win32')
+  subdir_done()
+endif
+
 common_user_inc += include_directories('include/host/' / host_arch)
 common_user_inc += include_directories('include')
 

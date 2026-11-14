@@ -175,6 +175,12 @@ QEMU_EXTERN_C int daemon(int, int);
 
 #ifdef _WIN32
 #include "system/os-win32.h"
+/* CONFIG_USER_ONLY is poisoned in common code: test it only where allowed */
+#if defined(COMPILING_PER_TARGET) || defined(COMPILING_SYSTEM_VS_USER)
+#ifdef CONFIG_USER_ONLY
+#include "user/win32-mman.h"
+#endif
+#endif
 #endif
 
 #if defined(CONFIG_POSIX) && !defined(EMSCRIPTEN)

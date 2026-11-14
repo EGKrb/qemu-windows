@@ -793,6 +793,8 @@ if [ -n "$host_arch" ] && [ -d "$source_path/common-user/host/$host_arch" ]; the
     if [ "$linux_user" != no ]; then
         if [ "$host_os" = linux ]; then
             linux_user=yes
+        elif [ "$linux_user" = yes ] && [ "$host_os" = windows ]; then
+            : # the frontend of linux-user/win32
         elif [ "$linux_user" = yes ]; then
             error_exit "linux-user not supported on this architecture"
         fi

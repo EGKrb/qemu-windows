@@ -28,11 +28,14 @@ endif
 common_ss.add(gdbstub_xml)
 
 # We build two versions of gdbstub, one for each mode
+# (linux-user/win32 has none yet: stubs there)
+if host_os != 'windows'
 user_ss.add(files(
   'gdbstub.c',
   'syscalls.c',
   'user.c'
 ))
+endif
 
 system_ss.add(files(
   'gdbstub.c',
@@ -41,4 +44,6 @@ system_ss.add(files(
 ))
 
 # The user-target is specialised by the guest
+if host_os != 'windows'
 specific_ss.add(when: 'CONFIG_USER_ONLY', if_true: files('user-target.c'))
+endif

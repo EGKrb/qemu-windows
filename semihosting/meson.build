@@ -16,7 +16,10 @@ system_ss.add(when: 'CONFIG_ARM_COMPATIBLE_SEMIHOSTING',
   if_true: files('arm-compat-semi.c'))
 stub_ss.add(files('arm-compat-semi-stub.c'))
 
+# linux-user/win32 has no semihosting: the stubs
+if host_os != 'windows'
 specific_ss.add(when: ['CONFIG_SEMIHOSTING', 'CONFIG_USER_ONLY'],
                 if_true: files('syscalls.c'))
 specific_ss.add(when: ['CONFIG_ARM_COMPATIBLE_SEMIHOSTING', 'CONFIG_USER_ONLY'],
 		if_true: files('arm-compat-semi.c'))
+endif

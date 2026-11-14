@@ -231,8 +231,8 @@ have_vhost_vdpa = get_option('vhost_vdpa') \
   .require(host_os == 'linux',
            error_message: 'vhost-vdpa is only available on Linux').allowed()
 have_vhost_kernel = get_option('vhost_kernel') \
-  .require(host_os == 'linux',
-           error_message: 'vhost-kernel is only available on Linux').allowed()
+  .require(host_os in ['linux', 'windows'],
+           error_message: 'vhost-kernel is only available on Linux and Windows').allowed()
 have_vhost_user_crypto = get_option('vhost_crypto') \
   .require(have_vhost_user,
            error_message: 'vhost-crypto requires vhost-user to be enabled').allowed()
@@ -3307,7 +3307,7 @@ foreach target : target_dirs
   endif
 
   if target.endswith('linux-user')
-    if host_os != 'linux'
+    if host_os not in ['linux', 'windows']
       if default_targets
         continue
       endif
@@ -4401,11 +4401,14 @@ foreach target : target_dirs
     )
     if 'CONFIG_LINUX_USER' in config_target
       dir = base_dir / abi
-      arch_srcs += files(
-        dir / 'cpu_loop.c',
-        dir / 'elfload.c',
-        dir / 'signal.c',
-      )
+      if host_os != 'windows'
+        # Windows: the frontend of linux-user/win32 has its own
+        arch_srcs += files(
+          dir / 'cpu_loop.c',
+          dir / 'elfload.c',
+          dir / 'signal.c',
+        )
+      endif
       if config_target.has_key('TARGET_SYSTBL_ABI')
         arch_srcs += \
           syscall_nr_generators[abi].process(base_dir / abi / config_target['TARGET_SYSTBL'],
