@@ -11,12 +11,16 @@ linux_user_ss.add(files(
   'syscall.c',
 ))
 linux_user_ss.add(when: 'TARGET_AARCH64', if_true: files('cpu_loop-aarch64.c'))
+linux_user_ss.add(when: 'TARGET_X86_64', if_true: files('cpu_loop-x86_64.c'))
 
-syscall_nr_generators = {
-  'aarch64': generator(sh,
-                      arguments: [ meson.current_source_dir() / '../aarch64/syscallhdr.sh',
-                                   '@INPUT@', '@OUTPUT@', '@EXTRA_ARGS@' ],
-                      output: '@BASENAME@_nr.h')
-}
+syscall_nr_generators = {}
+foreach arch : ['aarch64', 'x86_64']
+  syscall_nr_generators += {
+    arch: generator(sh,
+                    arguments: [ meson.current_source_dir() / '..' / arch / 'syscallhdr.sh',
+                                 '@INPUT@', '@OUTPUT@', '@EXTRA_ARGS@' ],
+                    output: '@BASENAME@_nr.h')
+  }
+endforeach
 
 specific_ss.add_all(when: 'CONFIG_LINUX_USER', if_true: linux_user_ss)

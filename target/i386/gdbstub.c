@@ -22,7 +22,7 @@
 #include "cpu.h"
 #include "exec/gdbstub.h"
 #include "gdbstub/helpers.h"
-#ifdef CONFIG_LINUX_USER
+#if defined(CONFIG_LINUX_USER) && !defined(_WIN32)
 #include "linux-user/qemu.h"
 #endif
 
@@ -409,7 +409,7 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
     return 0;
 }
 
-#ifdef CONFIG_LINUX_USER
+#if defined(CONFIG_LINUX_USER) && !defined(_WIN32)
 
 #define IDX_ORIG_AX 0
 
@@ -508,7 +508,7 @@ void x86_cpu_gdb_init(CPUState *cs)
     }
 #endif
 
-#ifdef CONFIG_LINUX_USER
+#if defined(CONFIG_LINUX_USER) && !defined(_WIN32)
     gdb_register_coprocessor(cs, x86_cpu_gdb_read_linux_register,
                              x86_cpu_gdb_write_linux_register,
 #ifdef TARGET_X86_64

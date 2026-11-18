@@ -91,6 +91,10 @@ G_NORETURN void w32u_die_with_signal(int sig);
 #define W32U_ELF_MACHINE    183     /* EM_AARCH64 */
 #define W32U_ELF_PLATFORM   "aarch64"
 #endif
+#ifdef TARGET_X86_64
+#define W32U_ELF_MACHINE    62      /* EM_X86_64 */
+#define W32U_ELF_PLATFORM   "x86_64"
+#endif
 abi_ulong w32u_elf_hwcap(CPUState *cs);
 void w32u_init_main_thread(CPUState *cs, const W32UImage *image);
 

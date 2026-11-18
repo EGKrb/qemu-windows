@@ -122,6 +122,30 @@
 /* 100 ns intervals between 1601-01-01 and 1970-01-01 */
 #define FILETIME_UNIX_EPOCH 116444736000000000ULL
 
+#ifdef TARGET_X86_64
+/* the struct stat of x86_64 */
+struct lx_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint64_t st_nlink;
+    uint32_t st_mode;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t pad0;
+    uint64_t st_rdev;
+    int64_t st_size;
+    int64_t st_blksize;
+    int64_t st_blocks;
+    int64_t st_atime_sec;
+    uint64_t st_atime_nsec;
+    int64_t st_mtime_sec;
+    uint64_t st_mtime_nsec;
+    int64_t st_ctime_sec;
+    uint64_t st_ctime_nsec;
+    int64_t unused[3];
+};
+QEMU_BUILD_BUG_ON(sizeof(struct lx_stat) != 144);
+#else
 struct lx_stat {
     uint64_t st_dev;
     uint64_t st_ino;
@@ -144,6 +168,7 @@ struct lx_stat {
     uint32_t unused[2];
 };
 QEMU_BUILD_BUG_ON(sizeof(struct lx_stat) != 128);
+#endif
 
 struct lx_statx_timestamp {
     int64_t tv_sec;
@@ -1856,6 +1881,124 @@ static G_NORETURN void do_exit(int status)
     exit(status & 0xff);
 }
 
+#ifdef TARGET_X86_64
+#define LX_NOT_HANDLED  (-0x7fffffff)
+
+#define ARCH_SET_GS     0x1001
+#define ARCH_SET_FS     0x1002
+#define ARCH_GET_FS     0x1003
+#define ARCH_GET_GS     0x1004
+
+static abi_long sys_arch_prctl(CPUArchState *env, int code, abi_ulong addr)
+{
+    uint64_t v;
+
+    switch (code) {
+    case ARCH_SET_FS:
+    case ARCH_SET_GS:
+        if (addr >= reserved_va) {
+            return -LX_EPERM;
+        }
+        cpu_x86_load_seg(env, code == ARCH_SET_FS ? R_FS : R_GS, 0);
+        env->segs[code == ARCH_SET_FS ? R_FS : R_GS].base = addr;
+        return 0;
+    case ARCH_GET_FS:
+    case ARCH_GET_GS:
+        v = env->segs[code == ARCH_GET_FS ? R_FS : R_GS].base;
+        return put_guest(addr, &v, sizeof(v));
+    default:
+        return -LX_EINVAL;
+    }
+}
+
+/* getdents: the records of getdents64, in place (the same sizes) */
+static abi_long sys_getdents(int fd, abi_ulong buf, abi_ulong len)
+{
+    abi_long n = sys_getdents64(fd, buf, len);
+    abi_long off = 0;
+
+    while (n > 0 && off < n) {
+        uint8_t *rec = g2h_untagged(buf + off);
+        uint16_t reclen;
+        uint8_t type;
+        size_t namelen;
+
+        memcpy(&reclen, rec + 16, 2);
+        type = rec[18];
+        namelen = strnlen((char *)rec + 19, reclen - 19);
+        memmove(rec + 18, rec + 19, namelen + 1);
+        rec[reclen - 1] = type;
+        off += reclen;
+    }
+    return n;
+}
+
+static abi_long x86_64_legacy(CPUArchState *env, int num, abi_long arg1,
+                              abi_long arg2, abi_long arg3, abi_long arg4,
+                              abi_long arg5, abi_long arg6)
+{
+    HostStat st;
+    abi_long ret;
+
+    switch (num) {
+    case TARGET_NR_open:
+        return sys_openat(LX_AT_FDCWD, arg1, arg2, arg3);
+    case TARGET_NR_creat:
+        return sys_openat(LX_AT_FDCWD, arg1,
+                          LX_O_CREAT | LX_O_WRONLY | LX_O_TRUNC, arg2);
+    case TARGET_NR_stat:
+    case TARGET_NR_lstat:
+        ret = stat_at(LX_AT_FDCWD, arg1,
+                      num == TARGET_NR_lstat ? LX_AT_SYMLINK_NOFOLLOW : 0,
+                      &st);
+        return ret ? ret : put_stat(arg2, &st);
+    case TARGET_NR_access:
+        return sys_faccessat(LX_AT_FDCWD, arg1, arg2);
+    case TARGET_NR_pipe:
+        return sys_pipe2(arg1, 0);
+    case TARGET_NR_dup2:
+        if (arg1 == arg2) {
+            return get_fd(arg1) ? arg1 : -LX_EBADF;
+        }
+        return sys_dup3(arg1, arg2, 0);
+    case TARGET_NR_mkdir:
+        return sys_mkdirat(LX_AT_FDCWD, arg1);
+    case TARGET_NR_rmdir:
+        return sys_unlinkat(LX_AT_FDCWD, arg1, LX_AT_REMOVEDIR);
+    case TARGET_NR_unlink:
+        return sys_unlinkat(LX_AT_FDCWD, arg1, 0);
+    case TARGET_NR_rename:
+        return sys_renameat2(LX_AT_FDCWD, arg1, LX_AT_FDCWD, arg2, 0);
+    case TARGET_NR_readlink:
+        return sys_readlinkat(LX_AT_FDCWD, arg1, arg2, arg3);
+    case TARGET_NR_chmod:
+    case TARGET_NR_chown:
+    case TARGET_NR_lchown:
+        return stat_at(LX_AT_FDCWD, arg1,
+                       num == TARGET_NR_lchown ? LX_AT_SYMLINK_NOFOLLOW : 0,
+                       &st);
+    case TARGET_NR_getdents:
+        return sys_getdents(arg1, arg2, arg3);
+    case TARGET_NR_arch_prctl:
+        return sys_arch_prctl(env, arg1, arg2);
+    case TARGET_NR_time: {
+        int64_t t = g_get_real_time() / G_USEC_PER_SEC;
+
+        if (arg1) {
+            ret = put_guest(arg1, &t, sizeof(t));
+            if (ret) {
+                return ret;
+            }
+        }
+        return t;
+    }
+    case TARGET_NR_getpgrp:
+        return GetCurrentProcessId();
+    }
+    return LX_NOT_HANDLED;
+}
+#endif
+
 static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
                            abi_long arg2, abi_long arg3, abi_long arg4,
                            abi_long arg5, abi_long arg6)
@@ -1864,6 +2007,12 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
     HostStat st;
     abi_long ret;
 
+#ifdef TARGET_X86_64
+    ret = x86_64_legacy(env, num, arg1, arg2, arg3, arg4, arg5, arg6);
+    if (ret != LX_NOT_HANDLED) {
+        return ret;
+    }
+#endif
     switch (num) {
     case TARGET_NR_openat:
         return sys_openat(arg1, arg2, arg3, arg4);
