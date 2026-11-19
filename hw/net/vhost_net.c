@@ -268,7 +268,12 @@ struct vhost_net *vhost_net_init(VhostNetOptions *options)
 
     if (backend_kernel) {
         r = vhost_net_get_fd(options->net_backend);
+#ifdef _WIN32
+        /* the TAP device of Windows is a handle token: -2 and below */
+        if (r == -1) {
+#else
         if (r < 0) {
+#endif
             goto fail;
         }
         net->backend = r;
