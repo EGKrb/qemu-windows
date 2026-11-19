@@ -471,10 +471,37 @@ static gunichar2 *wide(const char *s)
     return g_utf8_to_utf16(s, -1, NULL, NULL, NULL);
 }
 
+const char *w32u_sysroot;
+
+/*
+ * The file under the sysroot, when there is one there (as path.c of
+ * linux-user does): the libraries and the interpreter of the guest
+ */
+static char *sysroot_path(const char *g)
+{
+    g_autofree char *p = NULL;
+
+    if (!w32u_sysroot || g[0] != '/' || !strcmp(g, "/") ||
+        g_str_has_prefix(g, "/proc/") || g_str_has_prefix(g, "/dev/") ||
+        g_str_has_prefix(g, "/tmp/") || !strcmp(g, "/tmp")) {
+        return NULL;
+    }
+    p = g_strconcat(w32u_sysroot, g, NULL);
+    if (g_file_test(p, G_FILE_TEST_EXISTS)) {
+        return g_steal_pointer(&p);
+    }
+    return NULL;
+}
+
 /* Host path of an absolute or cwd-relative guest path */
 static char *host_path(const char *g)
 {
     const char *d = g_str_has_prefix(g, "/mnt/") ? g + 4 : g;
+    char *s = sysroot_path(g);
+
+    if (s) {
+        return s;
+    }
 
     if (!strcmp(g, "/proc/self/exe")) {
         return g_strdup(exec_host_path);
@@ -489,6 +516,11 @@ static char *host_path(const char *g)
         return g_strdup_printf("%c:/%s", d[1], d[2] ? d + 3 : "");
     }
     return g_strdup(g);
+}
+
+char *w32u_host_path(const char *guest)
+{
+    return host_path(guest);
 }
 
 /* Guest form of a host path: "C:\x\y" -> "/c/x/y" */
@@ -1881,6 +1913,236 @@ static G_NORETURN void do_exit(int status)
     exit(status & 0xff);
 }
 
+
+/* poll, ppoll, select, pselect6 */
+
+#define LX_POLLIN       0x001
+#define LX_POLLPRI      0x002
+#define LX_POLLOUT      0x004
+#define LX_POLLERR      0x008
+#define LX_POLLHUP      0x010
+#define LX_POLLNVAL     0x020
+#define LX_POLLRDNORM   0x040
+#define LX_POLLWRNORM   0x100
+
+struct lx_pollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
+
+/* what @fd is ready for now (POLL* bits, before masking by events) */
+static int fd_ready(int fd)
+{
+    GuestFD *f = get_fd(fd);
+    HANDLE h;
+    DWORD type, avail = 0, n;
+    int acc;
+
+    if (!f) {
+        return LX_POLLNVAL;
+    }
+    if (f->kind != FD_HOST) {
+        return LX_POLLIN | LX_POLLOUT | LX_POLLRDNORM | LX_POLLWRNORM;
+    }
+    acc = f->flags & LX_O_ACCMODE;
+    h = fd_handle(f);
+    type = GetFileType(h);
+    if (type == FILE_TYPE_PIPE) {
+        if (acc == LX_O_WRONLY) {
+            /* the reader gone: an error, as EPIPE on writing */
+            if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) &&
+                GetLastError() == ERROR_BROKEN_PIPE) {
+                return LX_POLLERR;
+            }
+            return LX_POLLOUT | LX_POLLWRNORM;
+        }
+        if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) {
+            return GetLastError() == ERROR_BROKEN_PIPE ?
+                   LX_POLLHUP | LX_POLLIN : LX_POLLERR;
+        }
+        return avail ? LX_POLLIN | LX_POLLRDNORM : 0;
+    }
+    if (is_console(f)) {
+        int r = LX_POLLOUT | LX_POLLWRNORM;
+
+        if (acc != LX_O_WRONLY && GetNumberOfConsoleInputEvents(h, &n) && n) {
+            /* only key presses make input: drop the other events */
+            INPUT_RECORD rec;
+            DWORD got;
+
+            while (n-- && PeekConsoleInputW(h, &rec, 1, &got) && got) {
+                if (rec.EventType == KEY_EVENT && rec.Event.KeyEvent.bKeyDown &&
+                    rec.Event.KeyEvent.uChar.UnicodeChar) {
+                    r |= LX_POLLIN | LX_POLLRDNORM;
+                    break;
+                }
+                ReadConsoleInputW(h, &rec, 1, &got);
+            }
+        }
+        return r;
+    }
+    /* disk files, NUL, other devices: never wait */
+    return LX_POLLIN | LX_POLLOUT | LX_POLLRDNORM | LX_POLLWRNORM;
+}
+
+/*
+ * Wait until one of @p is ready or @timeout_ms (-1: forever) passes;
+ * returns the number of ready entries.  Windows has no single wait for
+ * pipes and consoles: they are looked at again, every 1 to 10 ms.
+ */
+static int do_poll(struct lx_pollfd *p, int n, int64_t timeout_ms)
+{
+    int64_t end = timeout_ms < 0 ? -1 :
+                  g_get_monotonic_time() / 1000 + timeout_ms;
+    DWORD nap = 1;
+    int i, ready;
+
+    for (;;) {
+        ready = 0;
+        for (i = 0; i < n; i++) {
+            int r;
+
+            p[i].revents = 0;
+            if (p[i].fd < 0) {
+                continue;
+            }
+            r = fd_ready(p[i].fd);
+            p[i].revents = r & (p[i].events | LX_POLLERR | LX_POLLHUP |
+                                LX_POLLNVAL);
+            if (p[i].revents) {
+                ready++;
+            }
+        }
+        if (ready || timeout_ms == 0) {
+            return ready;
+        }
+        if (end >= 0) {
+            int64_t left = end - g_get_monotonic_time() / 1000;
+
+            if (left <= 0) {
+                return 0;
+            }
+            nap = MIN(nap, left);
+        }
+        if (w32u_signal_pending()) {
+            return -LX_EINTR;
+        }
+        Sleep(nap);
+        nap = MIN(nap * 2, 10);
+    }
+}
+
+static abi_long sys_poll(abi_ulong addr, abi_ulong nfds, int64_t timeout_ms)
+{
+    struct lx_pollfd *p;
+    int ret;
+
+    if (nfds > W32U_MAX_FDS * 4) {
+        return -LX_EINVAL;
+    }
+    p = guest_ptr(addr, nfds * sizeof(*p), PAGE_READ | PAGE_WRITE);
+    if (!p && nfds) {
+        return -LX_EFAULT;
+    }
+    ret = do_poll(p, nfds, timeout_ms);
+    return ret;
+}
+
+/* a struct timespec of the guest in ms, -1 for NULL */
+static int64_t timespec_ms(abi_ulong addr, abi_long *err)
+{
+    struct lx_timespec *ts;
+
+    *err = 0;
+    if (!addr) {
+        return -1;
+    }
+    ts = guest_ptr(addr, sizeof(*ts), PAGE_READ);
+    if (!ts || ts->tv_sec < 0 || ts->tv_nsec < 0 ||
+        ts->tv_nsec >= NANOSECONDS_PER_SECOND) {
+        *err = ts ? -LX_EINVAL : -LX_EFAULT;
+        return 0;
+    }
+    return ts->tv_sec * 1000 + DIV_ROUND_UP(ts->tv_nsec, 1000000);
+}
+
+/* select: the fd_sets become a pollfd array, and back */
+static abi_long do_select(int nfds, abi_ulong raddr, abi_ulong waddr,
+                          abi_ulong eaddr, int64_t timeout_ms)
+{
+    uint64_t *sets[3] = { NULL, NULL, NULL };
+    abi_ulong addrs[3] = { raddr, waddr, eaddr };
+    size_t bytes;
+    g_autofree struct lx_pollfd *p = NULL;
+    int n = 0, i, k, ret;
+
+    if (nfds < 0 || nfds > 1024) {
+        return -LX_EINVAL;
+    }
+    bytes = DIV_ROUND_UP(nfds, 64) * 8;
+    for (k = 0; k < 3; k++) {
+        if (addrs[k] && bytes) {
+            sets[k] = guest_ptr(addrs[k], bytes, PAGE_READ | PAGE_WRITE);
+            if (!sets[k]) {
+                return -LX_EFAULT;
+            }
+        }
+    }
+    p = g_new0(struct lx_pollfd, nfds ? nfds : 1);
+    for (i = 0; i < nfds; i++) {
+        int16_t ev = 0;
+
+        if (sets[0] && (sets[0][i / 64] >> (i % 64) & 1)) {
+            ev |= LX_POLLIN;
+        }
+        if (sets[1] && (sets[1][i / 64] >> (i % 64) & 1)) {
+            ev |= LX_POLLOUT;
+        }
+        if (sets[2] && (sets[2][i / 64] >> (i % 64) & 1)) {
+            ev |= LX_POLLPRI;
+        }
+        if (ev) {
+            if (!get_fd(i)) {
+                return -LX_EBADF;
+            }
+            p[n].fd = i;
+            p[n].events = ev;
+            n++;
+        }
+    }
+    ret = do_poll(p, n, timeout_ms);
+    if (ret < 0) {
+        return ret;
+    }
+    for (k = 0; k < 3; k++) {
+        if (sets[k]) {
+            memset(sets[k], 0, bytes);
+        }
+    }
+    ret = 0;
+    for (i = 0; i < n; i++) {
+        int fd = p[i].fd;
+        int16_t r = p[i].revents;
+
+        if (sets[0] && (p[i].events & LX_POLLIN) &&
+            (r & (LX_POLLIN | LX_POLLHUP | LX_POLLERR))) {
+            sets[0][fd / 64] |= 1ULL << (fd % 64);
+            ret++;
+        }
+        if (sets[1] && (p[i].events & LX_POLLOUT) &&
+            (r & (LX_POLLOUT | LX_POLLERR))) {
+            sets[1][fd / 64] |= 1ULL << (fd % 64);
+            ret++;
+        }
+        if (sets[2] && (p[i].events & LX_POLLPRI) && (r & LX_POLLPRI)) {
+            sets[2][fd / 64] |= 1ULL << (fd % 64);
+            ret++;
+        }
+    }
+    return ret;
+}
+
 #ifdef TARGET_X86_64
 #define LX_NOT_HANDLED  (-0x7fffffff)
 
@@ -1994,6 +2256,24 @@ static abi_long x86_64_legacy(CPUArchState *env, int num, abi_long arg1,
     }
     case TARGET_NR_getpgrp:
         return GetCurrentProcessId();
+    case TARGET_NR_poll:
+        return sys_poll(arg1, arg2, (int)arg3 < 0 ? -1 : (int)arg3);
+    case TARGET_NR_select: {
+        int64_t ms = -1;
+
+        if (arg5) {
+            struct lx_timeval *tv = guest_ptr(arg5, sizeof(*tv), PAGE_READ);
+
+            if (!tv) {
+                return -LX_EFAULT;
+            }
+            if (tv->tv_sec < 0 || tv->tv_usec < 0) {
+                return -LX_EINVAL;
+            }
+            ms = tv->tv_sec * 1000 + DIV_ROUND_UP(tv->tv_usec, 1000);
+        }
+        return do_select(arg1, arg2, arg3, arg4, ms);
+    }
     }
     return LX_NOT_HANDLED;
 }
@@ -2016,6 +2296,16 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
     switch (num) {
     case TARGET_NR_openat:
         return sys_openat(arg1, arg2, arg3, arg4);
+    case TARGET_NR_ppoll: {
+        int64_t ms = timespec_ms(arg3, &ret);
+
+        return ret ? ret : sys_poll(arg1, arg2, ms);
+    }
+    case TARGET_NR_pselect6: {
+        int64_t ms = timespec_ms(arg5, &ret);
+
+        return ret ? ret : do_select(arg1, arg2, arg3, arg4, ms);
+    }
     case TARGET_NR_close:
         return sys_close(arg1);
     case TARGET_NR_read:

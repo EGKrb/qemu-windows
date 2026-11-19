@@ -1,7 +1,8 @@
 /*
  * Native Win32 linux-user prototype: static ELF loader
  *
- * Loads ET_EXEC and static-pie ET_DYN executables (no PT_INTERP yet).
+ * Loads ET_EXEC and ET_DYN executables, and their program interpreter
+ * (PT_INTERP, ld.so) found under the sysroot (-L) first.
  * Segments are copied into anonymous guest memory, which works whatever
  * their alignment; protections are then applied per 4 KiB page, with the
  * union of the segments sharing a page.  Builds the initial stack the way
@@ -38,7 +39,7 @@ static abi_ulong push_str(abi_ulong sp, const char *s)
 }
 
 static int load_segments(const uint8_t *data, gsize size, const Elf64_Ehdr *eh,
-                         W32UImage *image)
+                         abi_ulong base, W32UImage *image)
 {
     const Elf64_Phdr *ph = (const Elf64_Phdr *)(data + eh->e_phoff);
     abi_ulong lo = -1, hi = 0, bias = 0, npages, i;
@@ -46,11 +47,6 @@ static int load_segments(const uint8_t *data, gsize size, const Elf64_Ehdr *eh,
     abi_long ret;
 
     for (i = 0; i < eh->e_phnum; i++) {
-        if (ph[i].p_type == PT_INTERP) {
-            error_report("dynamically linked executables are not supported "
-                         "yet: link with -static");
-            return -LX_ENOSYS;
-        }
         if (ph[i].p_type != PT_LOAD || ph[i].p_memsz == 0) {
             continue;
         }
@@ -65,7 +61,7 @@ static int load_segments(const uint8_t *data, gsize size, const Elf64_Ehdr *eh,
         return -LX_EINVAL;
     }
     if (eh->e_type == ET_DYN) {
-        bias = W32U_PIE_BASE - lo;
+        bias = base - lo;
     }
 
     /* One writable mapping for the whole image, filled segment by segment */
@@ -163,9 +159,9 @@ static int setup_stack(const char *path, char **argv, char **envp,
     AUX(AT_PHENT, sizeof(Elf64_Phdr));
     AUX(AT_PHNUM, image->phnum);
     AUX(AT_PAGESZ, TARGET_PAGE_SIZE);
-    AUX(AT_BASE, 0);
+    AUX(AT_BASE, image->interp_bias);
     AUX(AT_FLAGS, 0);
-    AUX(AT_ENTRY, image->entry);
+    AUX(AT_ENTRY, image->prog_entry);
     AUX(AT_UID, 1000);
     AUX(AT_EUID, 1000);
     AUX(AT_GID, 1000);
@@ -205,26 +201,22 @@ static int setup_stack(const char *path, char **argv, char **envp,
     return 0;
 }
 
-int w32u_load_elf(const char *path, char **argv, char **envp,
-                  W32UImage *image)
+static int read_elf(const char *path, gchar **data, gsize *size)
 {
-    g_autofree gchar *data = NULL;
     g_autoptr(GError) err = NULL;
     const Elf64_Ehdr *eh;
-    gsize size;
-    int ret;
 
-    if (!g_file_get_contents(path, &data, &size, &err)) {
+    if (!g_file_get_contents(path, data, size, &err)) {
         error_report("%s", err->message);
         return -LX_ENOENT;
     }
-    eh = (const Elf64_Ehdr *)data;
-    if (size < sizeof(*eh) || memcmp(eh->e_ident, ELFMAG, SELFMAG) ||
+    eh = (const Elf64_Ehdr *)*data;
+    if (*size < sizeof(*eh) || memcmp(eh->e_ident, ELFMAG, SELFMAG) ||
         eh->e_ident[EI_CLASS] != ELFCLASS64 ||
         eh->e_ident[EI_DATA] != ELFDATA2LSB ||
         (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) ||
         eh->e_phentsize != sizeof(Elf64_Phdr) ||
-        eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) > size) {
+        eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) > *size) {
         error_report("%s: not a 64-bit little-endian ELF executable", path);
         return -LX_EINVAL;
     }
@@ -232,11 +224,67 @@ int w32u_load_elf(const char *path, char **argv, char **envp,
         error_report("%s: Invalid ELF image for this architecture", path);
         return -LX_EINVAL;
     }
+    return 0;
+}
 
-    memset(image, 0, sizeof(*image));
-    ret = load_segments((const uint8_t *)data, size, eh, image);
+/* the PT_INTERP of a program, NULL without one */
+static char *elf_interp(const uint8_t *data, gsize size)
+{
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
+    const Elf64_Phdr *ph = (const Elf64_Phdr *)(data + eh->e_phoff);
+    int i;
+
+    for (i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_INTERP && ph[i].p_filesz &&
+            ph[i].p_offset + ph[i].p_filesz <= size) {
+            return g_strndup((const char *)data + ph[i].p_offset,
+                             ph[i].p_filesz);
+        }
+    }
+    return NULL;
+}
+
+int w32u_load_elf(const char *path, char **argv, char **envp,
+                  W32UImage *image)
+{
+    g_autofree gchar *data = NULL, *idata = NULL, *interp = NULL;
+    g_autofree char *ipath = NULL;
+    W32UImage ii;
+    gsize size, isize;
+    int ret;
+
+    ret = read_elf(path, &data, &size);
     if (ret < 0) {
         return ret;
+    }
+    memset(image, 0, sizeof(*image));
+    ret = load_segments((const uint8_t *)data, size,
+                        (const Elf64_Ehdr *)data, W32U_PIE_BASE, image);
+    if (ret < 0) {
+        return ret;
+    }
+    image->prog_entry = image->entry;
+
+    /* a dynamic program starts in its interpreter */
+    interp = elf_interp((const uint8_t *)data, size);
+    if (interp) {
+        ipath = w32u_host_path(interp);
+        ret = read_elf(ipath, &idata, &isize);
+        if (ret < 0) {
+            error_report("%s: cannot load the interpreter %s%s", path,
+                         interp, w32u_sysroot ? "" :
+                         " (give the guest's root with -L or "
+                         "QEMU_LD_PREFIX)");
+            return ret;
+        }
+        memset(&ii, 0, sizeof(ii));
+        ret = load_segments((const uint8_t *)idata, isize,
+                            (const Elf64_Ehdr *)idata, W32U_INTERP_BASE, &ii);
+        if (ret < 0) {
+            return ret;
+        }
+        image->entry = ii.entry;
+        image->interp_bias = ii.load_bias;
     }
     return setup_stack(path, argv, envp, image);
 }

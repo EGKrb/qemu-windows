@@ -20,6 +20,8 @@
 #define W32U_STACK_SIZE     (8 * 1024 * 1024)
 /* Load address of position independent (static-pie) executables */
 #define W32U_PIE_BASE       0x400000000ULL
+/* Load address of the program interpreter (ld.so) */
+#define W32U_INTERP_BASE    0x600000000ULL
 /* First address searched for mmap without a hint */
 #define W32U_MMAP_BASE      0x800000000ULL
 
@@ -63,7 +65,14 @@ typedef struct W32UImage {
     abi_ulong phnum;
     abi_ulong brk;
     abi_ulong start_stack;
+    abi_ulong prog_entry;           /* AT_ENTRY: the program's */
+    abi_ulong interp_bias;          /* AT_BASE: ld.so's, 0 without one */
 } W32UImage;
+
+/* -L / QEMU_LD_PREFIX: guest files are looked for there first */
+extern const char *w32u_sysroot;
+/* the host path of a guest path */
+char *w32u_host_path(const char *guest);
 
 extern __thread CPUState *thread_cpu;
 extern bool w32u_strace;
@@ -84,6 +93,8 @@ int w32u_load_elf(const char *path, char **argv, char **envp,
 /* fault.c: vectored exception handler replacing SIGSEGV */
 void w32u_fault_init(void);
 int w32u_take_pending_signal(void);
+/* a signal waits for the guest: blocking syscalls end with EINTR */
+bool w32u_signal_pending(void);
 G_NORETURN void w32u_die_with_signal(int sig);
 
 /* cpu_loop-<target>.c: per-architecture ABI */

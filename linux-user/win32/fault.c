@@ -170,3 +170,8 @@ void w32u_fault_init(void)
         exit(EXIT_FAILURE);
     }
 }
+
+bool w32u_signal_pending(void)
+{
+    return pending_signal != 0;
+}

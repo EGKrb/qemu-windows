@@ -61,6 +61,8 @@ static G_NORETURN void usage(int exitcode)
            "-U var                          unset an environment variable "
            "for the guest\n"
            "-0 argv0                        force the guest argv[0]\n"
+           "-L path          QEMU_LD_PREFIX set the elf interpreter prefix "
+           "to 'path'\n"
            "-d item[,...]    QEMU_LOG       enable logging of items "
            "(-d help for list)\n"
            "-D logfile       QEMU_LOG_FILENAME  write logs to 'logfile' "
@@ -111,6 +113,9 @@ static void parse_env(void)
     }
     if ((s = g_getenv("QEMU_RAND_SEED"))) {
         seed_optarg = s;
+    }
+    if ((s = g_getenv("QEMU_LD_PREFIX"))) {
+        w32u_sysroot = s;
     }
     if (g_getenv("QEMU_STRACE")) {
         w32u_strace = true;
@@ -166,6 +171,8 @@ static int parse_args(int argc, char **argv, char ***envp)
                 log_filename = arg;
             } else if (!strcmp(opt, "seed")) {
                 seed_optarg = arg;
+            } else if (!strcmp(opt, "L")) {
+                w32u_sysroot = arg;
             } else {
                 fprintf(stderr, "qemu: unknown option '%s'\n", argv[i]);
                 exit(EXIT_FAILURE);
