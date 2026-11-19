@@ -904,12 +904,11 @@ static int tap_win32_vhost_fd(const NetdevTapOptions *tap, Error **errp)
             return -2;
         }
     }
-    fd = _open_osfhandle((intptr_t)h, _O_BINARY);
-    if (fd < 0) {
-        CloseHandle(h);
-        error_setg(errp, "invalid vhost-net handle");
-        return -2;
-    }
+    /*
+     * a handle token: the C runtime gives no descriptor to a device of an
+     * unknown type (GetFileType); tokens are -3 and below
+     */
+    fd = w32fd_handle_token(h);
     return fd;
 #else
     error_setg(errp, "vhost-net support was not built");
@@ -924,7 +923,7 @@ static int tap_win32_finish(TAPState *s, int vhostfd, uint32_t poll_us,
 #ifdef CONFIG_VHOST_KERNEL
     VhostNetOptions options = { 0 };
 
-    if (vhostfd < 0) {
+    if (vhostfd == -1) {
         return 0;
     }
     options.backend_type = VHOST_BACKEND_TYPE_KERNEL;
@@ -1288,8 +1287,8 @@ fail:
         g_free(created);
     }
 fail_vhost:
-    if (vhostfd >= 0) {
-        close(vhostfd);
+    if (w32fd_is_token(vhostfd)) {
+        CloseHandle(w32fd_token_handle(vhostfd));
     }
     return -1;
 }

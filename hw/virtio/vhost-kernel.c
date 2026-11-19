@@ -52,7 +52,9 @@ static int vhost_kernel_call(struct vhost_dev *dev, unsigned long int request,
                              void *arg)
 {
     int fd = (uintptr_t) dev->opaque;
-    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    /* the device: a handle token (net/tap-win32.c), or a descriptor */
+    HANDLE h = w32fd_is_token(fd) ? w32fd_token_handle(fd)
+                                  : (HANDLE)_get_osfhandle(fd);
     DWORD size = _IOC_SIZE(request), got = 0;
     struct vhost_vring_file file;
 
@@ -133,6 +135,11 @@ static int vhost_kernel_cleanup(struct vhost_dev *dev)
 
     assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_KERNEL);
 
+#ifdef _WIN32
+    if (w32fd_is_token(fd)) {
+        return CloseHandle(w32fd_token_handle(fd)) ? 0 : -EBADF;
+    }
+#endif
     return close(fd) < 0 ? -errno : 0;
 }
 
