@@ -109,6 +109,22 @@ G_NORETURN void w32u_die_with_signal(int sig);
 abi_ulong w32u_elf_hwcap(CPUState *cs);
 void w32u_init_main_thread(CPUState *cs, const W32UImage *image);
 
+/* thread.c: threads and futexes */
+extern const char *w32u_cpu_type;
+void w32u_thread_init(void);
+abi_long w32u_gettid(void);
+abi_long w32u_set_tid_address(abi_ulong addr);
+abi_long w32u_futex(abi_ulong uaddr, int op, uint32_t val, abi_ulong timeout,
+                    abi_ulong uaddr2, uint32_t val3);
+int w32u_futex_wake(abi_ulong addr, int n);
+abi_long w32u_clone_thread(CPUArchState *env, uint64_t flags,
+                           abi_ulong newsp, abi_ulong ptid, abi_ulong ctid,
+                           abi_ulong tls);
+G_NORETURN void w32u_exit_thread(int status);
+/* cpu_loop-<target>.c: the registers of a new thread */
+void w32u_clone_regs(CPUArchState *env, abi_ulong newsp, bool settls,
+                     abi_ulong tls);
+
 /* syscall.c */
 void w32u_syscall_init(const char *exec_path);
 abi_long w32u_syscall(CPUArchState *env, int num, abi_long arg1,

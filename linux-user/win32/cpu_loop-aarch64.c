@@ -73,6 +73,18 @@ void w32u_init_main_thread(CPUState *cs, const W32UImage *image)
     }
 }
 
+void w32u_clone_regs(CPUArchState *env, abi_ulong newsp, bool settls,
+                     abi_ulong tls)
+{
+    if (newsp) {
+        env->xregs[31] = newsp;
+    }
+    env->xregs[0] = 0;
+    if (settls) {
+        env->cp15.tpidr_el[0] = tls;
+    }
+}
+
 void cpu_loop(CPUARMState *env)
 {
     CPUState *cs = env_cpu(env);

@@ -9,6 +9,7 @@ linux_user_ss.add(files(
   'mem.c',
   'stubs.c',
   'syscall.c',
+  'thread.c',
 ))
 linux_user_ss.add(when: 'TARGET_AARCH64', if_true: files('cpu_loop-aarch64.c'))
 linux_user_ss.add(when: 'TARGET_X86_64', if_true: files('cpu_loop-x86_64.c'))

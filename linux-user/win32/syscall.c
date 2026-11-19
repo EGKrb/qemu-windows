@@ -1727,45 +1727,6 @@ static abi_long sys_clock_nanosleep(int clk, int flags, abi_ulong req,
     return 0;
 }
 
-static abi_long sys_futex(abi_ulong uaddr, int op, uint32_t val,
-                          abi_ulong timeout)
-{
-    uint32_t *p = guest_ptr(uaddr, sizeof(*p), PAGE_READ);
-    int64_t ns;
-    abi_long ret;
-
-    if (!p) {
-        return -LX_EFAULT;
-    }
-    switch (op & LX_FUTEX_CMD_MASK) {
-    case LX_FUTEX_WAKE:
-    case LX_FUTEX_WAKE_BITSET:
-        /* there is no other guest thread to wake */
-        return 0;
-    case LX_FUTEX_WAIT:
-    case LX_FUTEX_WAIT_BITSET:
-        if (qatomic_read(p) != val) {
-            return -LX_EAGAIN;
-        }
-        if (!timeout) {
-            error_report("futex wait on 0x" TARGET_ABI_FMT_lx " would never "
-                         "return: the guest has a single thread", uaddr);
-            w32u_die_with_signal(6);        /* SIGABRT */
-        }
-        ret = get_timespec_ns(timeout, &ns);
-        if (ret) {
-            return ret;
-        }
-        /* FUTEX_WAIT takes a relative timeout, FUTEX_WAIT_BITSET an absolute */
-        if ((op & LX_FUTEX_CMD_MASK) == LX_FUTEX_WAIT_BITSET) {
-            ns -= clock_ns(op & LX_FUTEX_CLOCK_REALTIME ? LX_CLOCK_REALTIME : LX_CLOCK_MONOTONIC);
-        }
-        sleep_ns(ns);
-        return -LX_ETIMEDOUT;
-    default:
-        return -LX_ENOSYS;
-    }
-}
 
 /* Process */
 
@@ -1905,6 +1866,63 @@ static abi_long sys_prctl(int option, abi_ulong arg2)
     default:
         return -LX_EINVAL;
     }
+}
+
+/* statfs, fstatfs: the volume of the path or descriptor */
+struct lx_statfs {
+    int64_t f_type;
+    int64_t f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    int32_t f_fsid[2];
+    int64_t f_namelen;
+    int64_t f_frsize;
+    int64_t f_flags;
+    int64_t f_spare[4];
+};
+QEMU_BUILD_BUG_ON(sizeof(struct lx_statfs) != 120);
+
+static abi_long sys_statfs(bool by_fd, abi_ulong arg, abi_ulong buf)
+{
+    g_autofree char *path = NULL;
+    g_autofree gunichar2 *w = NULL;
+    wchar_t root[MAX_PATH];
+    ULARGE_INTEGER avail, total, free;
+    DWORD serial = 0;
+    struct lx_statfs s = { 0 };
+    abi_long ret;
+
+    if (by_fd) {
+        GuestFD *f = get_fd(arg);
+
+        if (!f) {
+            return -LX_EBADF;
+        }
+        path = g_strdup(f->path ? f->path : ".");
+    } else {
+        ret = get_path_at(LX_AT_FDCWD, arg, &path);
+        if (ret) {
+            return ret;
+        }
+    }
+    w = wide(path);
+    if (!GetVolumePathNameW((wchar_t *)w, root, MAX_PATH) ||
+        !GetDiskFreeSpaceExW(root, &avail, &total, &free)) {
+        return last_win_error();
+    }
+    GetVolumeInformationW(root, NULL, 0, &serial, NULL, NULL, NULL, 0);
+    s.f_type = 0x5346544e;              /* NTFS_SB_MAGIC */
+    s.f_bsize = s.f_frsize = 4096;
+    s.f_blocks = total.QuadPart / 4096;
+    s.f_bfree = free.QuadPart / 4096;
+    s.f_bavail = avail.QuadPart / 4096;
+    s.f_files = s.f_ffree = 1 << 24;
+    s.f_fsid[0] = serial;
+    s.f_namelen = 255;
+    return put_guest(buf, &s, sizeof(s));
 }
 
 static G_NORETURN void do_exit(int status)
@@ -2468,11 +2486,33 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
     }
 
     case TARGET_NR_exit:
+        w32u_exit_thread(arg1);
     case TARGET_NR_exit_group:
         do_exit(arg1);
     case TARGET_NR_set_tid_address:
-    case TARGET_NR_getpid:
+        return w32u_set_tid_address(arg1);
     case TARGET_NR_gettid:
+        return w32u_gettid();
+    case TARGET_NR_getgroups:
+        /* one group, the user's */
+        if (arg1) {
+            int32_t g = W32U_UID;
+
+            if ((int)arg1 < 0) {
+                return -LX_EINVAL;
+            }
+            ret = put_guest(arg2, &g, sizeof(g));
+            if (ret) {
+                return ret;
+            }
+        }
+        return 1;
+    case TARGET_NR_setgroups:
+        return -LX_EPERM;
+    case TARGET_NR_statfs:
+    case TARGET_NR_fstatfs:
+        return sys_statfs(num == TARGET_NR_fstatfs, arg1, arg2);
+    case TARGET_NR_getpid:
     case TARGET_NR_getpgid:
     case TARGET_NR_getsid:
     case TARGET_NR_setsid:
@@ -2542,7 +2582,7 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
     case TARGET_NR_set_robust_list:
         return 0;
     case TARGET_NR_futex:
-        return sys_futex(arg1, arg2, arg3, arg4);
+        return w32u_futex(arg1, arg2, arg3, arg4, arg5, arg6);
     case TARGET_NR_kill:
         return sys_kill(arg1, arg2);
     case TARGET_NR_tkill:
@@ -2571,7 +2611,19 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
     case TARGET_NR_wait4:
         return -LX_ECHILD;
     case TARGET_NR_clone:
+        /* the order of x86_64; the others: flags, sp, ptid, tls, ctid */
+#ifdef TARGET_X86_64
+        if ((arg1 & 0x10000) /* CLONE_THREAD */) {
+            return w32u_clone_thread(env, arg1, arg2, arg3, arg4, arg5);
+        }
+#else
+        if ((arg1 & 0x10000) /* CLONE_THREAD */) {
+            return w32u_clone_thread(env, arg1, arg2, arg3, arg5, arg4);
+        }
+#endif
+        return -LX_ENOSYS;
     case TARGET_NR_clone3:
+        /* glibc then uses clone */
     case TARGET_NR_execve:
     case TARGET_NR_rseq:
         return -LX_ENOSYS;

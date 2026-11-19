@@ -247,7 +247,9 @@ int main(int argc, char **argv)
     set_preferred_target_page_bits(ctz32(qemu_real_host_page_size()));
     finalize_target_page_bits();
 
-    cpu = cpu_create(parse_cpu_option(cpu_model ? cpu_model : "max"));
+    w32u_cpu_type = parse_cpu_option(cpu_model ? cpu_model : "max");
+    w32u_thread_init();
+    cpu = cpu_create(w32u_cpu_type);
     cpu_reset(cpu);
     thread_cpu = cpu;
 

@@ -123,6 +123,19 @@ void w32u_init_main_thread(CPUState *cs, const W32UImage *image)
     cpu_x86_load_seg(env, R_GS, 0);
 }
 
+void w32u_clone_regs(CPUArchState *env, abi_ulong newsp, bool settls,
+                     abi_ulong tls)
+{
+    if (newsp) {
+        env->regs[R_ESP] = newsp;
+    }
+    env->regs[R_EAX] = 0;
+    if (settls) {
+        cpu_x86_load_seg(env, R_FS, 0);
+        env->segs[R_FS].base = tls;
+    }
+}
+
 void cpu_loop(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);
