@@ -57,6 +57,9 @@
 #define LX_EILSEQ       84
 #define LX_EOPNOTSUPP   95
 #define LX_ETIMEDOUT    110
+#define LX_E2BIG        7
+#define LX_ENOEXEC      8
+#define LX_ELOOP        40
 
 typedef struct W32UImage {
     abi_ulong entry;
@@ -125,7 +128,47 @@ G_NORETURN void w32u_exit_thread(int status);
 void w32u_clone_regs(CPUArchState *env, abi_ulong newsp, bool settls,
                      abi_ulong tls);
 
+/* process.c: execve, fork, wait4 */
+typedef struct W32ULaunch {
+    GPtrArray *args, *env;          /* of the guest, NULL-terminated */
+    char *fds, *sysroot, *cpu, *path;
+    uint64_t vpid, ppid;
+    bool fork;                      /* a child of fork: the parent's state */
+    HANDLE parent, copied;
+    uint64_t parent_base;
+    GArray *regions;                /* start, end, flags */
+    abi_ulong memstate[4];
+    uint8_t *envbytes;
+    size_t envlen;
+    uint64_t clone[4];              /* newsp, settls, tls */
+} W32ULaunch;
+extern abi_long w32u_vpid, w32u_vppid;
+extern bool w32u_qemu_parent;
+W32ULaunch *w32u_launch_read(void);
+void w32u_process_init(W32ULaunch *l);
+abi_long w32u_execve(abi_ulong path, abi_ulong argv, abi_ulong envp);
+abi_long w32u_fork(CPUArchState *env, uint64_t flags, abi_ulong newsp,
+                   abi_ulong ptid, abi_ulong ctid, abi_ulong tls);
+G_NORETURN void w32u_fork_child(W32ULaunch *l, CPUState *cpu);
+abi_long w32u_wait4(abi_long pid, abi_ulong status, int options,
+                    abi_ulong rusage);
+/* this process now waits for the one execve() started */
+void w32u_become_proxy(void);
+/* mem.c: brk and mmap state, for fork */
+void w32u_mem_get_state(abi_ulong st[4]);
+void w32u_mem_set_state(const abi_ulong st[4]);
+/* cpu_loop-<target>.c: host pointers of a CPU copied from another process */
+void w32u_env_after_fork(CPUArchState *env);
+
 /* syscall.c */
+abi_long w32u_get_guest(abi_ulong addr, void *buf, size_t len);
+abi_long w32u_put_guest(abi_ulong addr, const void *buf, size_t len);
+abi_long w32u_get_guest_str(abi_ulong addr, char **out);
+const char *w32u_exec_path(void);
+/* the descriptors for a new process: handles to inherit, the description */
+char *w32u_fds_export(GArray *inherit, bool exec, HANDLE std[3]);
+void w32u_fds_close_all(void);
+void w32u_syscall_init_launch(const char *exec_path, const char *fds);
 void w32u_syscall_init(const char *exec_path);
 abi_long w32u_syscall(CPUArchState *env, int num, abi_long arg1,
                       abi_long arg2, abi_long arg3, abi_long arg4,

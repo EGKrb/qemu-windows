@@ -136,6 +136,11 @@ void w32u_clone_regs(CPUArchState *env, abi_ulong newsp, bool settls,
     }
 }
 
+void w32u_env_after_fork(CPUArchState *env)
+{
+    memset(env->cpu_breakpoint, 0, sizeof(env->cpu_breakpoint));
+}
+
 void cpu_loop(CPUX86State *env)
 {
     CPUState *cs = env_cpu(env);

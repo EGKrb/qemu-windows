@@ -2273,7 +2273,10 @@ static abi_long x86_64_legacy(CPUArchState *env, int num, abi_long arg1,
         return t;
     }
     case TARGET_NR_getpgrp:
-        return GetCurrentProcessId();
+        return w32u_vpid;
+    case TARGET_NR_fork:
+    case TARGET_NR_vfork:
+        return w32u_fork(env, 0, 0, 0, 0, 0);
     case TARGET_NR_poll:
         return sys_poll(arg1, arg2, (int)arg3 < 0 ? -1 : (int)arg3);
     case TARGET_NR_select: {
@@ -2513,13 +2516,18 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
     case TARGET_NR_fstatfs:
         return sys_statfs(num == TARGET_NR_fstatfs, arg1, arg2);
     case TARGET_NR_getpid:
+        return w32u_vpid;
+    case TARGET_NR_wait4:
+        return w32u_wait4(arg1, arg2, arg3, arg4);
+    case TARGET_NR_execve:
+        return w32u_execve(arg1, arg2, arg3);
     case TARGET_NR_getpgid:
     case TARGET_NR_getsid:
     case TARGET_NR_setsid:
         /* a single thread: tid == pid, leader of its group and session */
         return GetCurrentProcessId();
     case TARGET_NR_getppid:
-        return 1;
+        return w32u_vppid;
     case TARGET_NR_setpgid:
         return 0;
     case TARGET_NR_getuid:
@@ -2608,8 +2616,6 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
         }
         return 0;
 
-    case TARGET_NR_wait4:
-        return -LX_ECHILD;
     case TARGET_NR_clone:
         /* the order of x86_64; the others: flags, sp, ptid, tls, ctid */
 #ifdef TARGET_X86_64
@@ -2621,10 +2627,13 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
             return w32u_clone_thread(env, arg1, arg2, arg3, arg5, arg4);
         }
 #endif
-        return -LX_ENOSYS;
+#ifdef TARGET_X86_64
+        return w32u_fork(env, arg1, arg2, arg3, arg4, arg5);
+#else
+        return w32u_fork(env, arg1, arg2, arg3, arg5, arg4);
+#endif
     case TARGET_NR_clone3:
         /* glibc then uses clone */
-    case TARGET_NR_execve:
     case TARGET_NR_rseq:
         return -LX_ENOSYS;
 
@@ -2671,6 +2680,144 @@ abi_long w32u_syscall(CPUArchState *env, int num, abi_long arg1,
 static void restore_console_cp(void)
 {
     SetConsoleOutputCP(saved_console_cp);
+}
+
+abi_long w32u_get_guest(abi_ulong addr, void *buf, size_t len)
+{
+    void *p = guest_ptr(addr, len, PAGE_READ);
+
+    if (!p) {
+        return -LX_EFAULT;
+    }
+    memcpy(buf, p, len);
+    return 0;
+}
+
+abi_long w32u_put_guest(abi_ulong addr, const void *buf, size_t len)
+{
+    return put_guest(addr, buf, len);
+}
+
+abi_long w32u_get_guest_str(abi_ulong addr, char **out)
+{
+    return get_guest_str(addr, out);
+}
+
+const char *w32u_exec_path(void)
+{
+    return exec_host_path;
+}
+
+/*
+ * The descriptors a new process gets (all for fork, without the
+ * close-on-exec ones for execve): inheritable copies of their handles in
+ * @inherit, @std for its standard handles, and their description:
+ * "fd kind flags cloexec handle path-in-hex;" for each
+ */
+char *w32u_fds_export(GArray *inherit, bool exec, HANDLE std[3])
+{
+    GString *s = g_string_new(NULL);
+    int fd;
+
+    for (fd = 0; fd < W32U_MAX_FDS; fd++) {
+        GuestFD *f = &fds[fd];
+        HANDLE dup = NULL;
+        const char *p;
+
+        if (f->kind == FD_FREE || (exec && f->cloexec)) {
+            continue;
+        }
+        if (f->kind == FD_HOST &&
+            !DuplicateHandle(GetCurrentProcess(), fd_handle(f),
+                             GetCurrentProcess(), &dup, 0, TRUE,
+                             DUPLICATE_SAME_ACCESS)) {
+            continue;
+        }
+        if (dup) {
+            g_array_append_val(inherit, dup);
+            if (fd < 3) {
+                std[fd] = dup;
+            }
+        }
+        g_string_append_printf(s, "%d %d %d %d %llu ", fd, f->kind, f->flags,
+                               !exec && f->cloexec,
+                               (unsigned long long)(uintptr_t)dup);
+        for (p = f->path ? f->path : ""; *p; p++) {
+            g_string_append_printf(s, "%02x", (uint8_t)*p);
+        }
+        g_string_append(s, "-;");
+    }
+    return g_string_free(s, false);
+}
+
+static void fds_import(const char *spec)
+{
+    g_auto(GStrv) items = g_strsplit(spec, ";", -1);
+    int i;
+
+    for (i = 0; items[i]; i++) {
+        int fd, kind, flags, cloexec, n = 0;
+        unsigned long long h;
+        char hex[2 * PATH_MAX + 2] = "";
+        GString *path;
+        const char *p;
+
+        if (sscanf(items[i], "%d %d %d %d %llu %n", &fd, &kind, &flags,
+                   &cloexec, &h, &n) < 5 || fd < 0 || fd >= W32U_MAX_FDS) {
+            continue;
+        }
+        pstrcpy(hex, sizeof(hex), items[i] + n);
+        path = g_string_new(NULL);
+        for (p = hex; p[0] && p[1] && p[0] != '-'; p += 2) {
+            g_string_append_c(path, g_ascii_xdigit_value(p[0]) * 16 +
+                                    g_ascii_xdigit_value(p[1]));
+        }
+        fds[fd] = (GuestFD) {
+            .kind = kind,
+            .flags = flags,
+            .cloexec = cloexec,
+            .path = path->len ? g_string_free(path, false) : NULL,
+        };
+        if (!fds[fd].path) {
+            g_string_free(path, true);
+        }
+        if (kind == FD_HOST) {
+            int acc = (flags & LX_O_ACCMODE) == LX_O_RDONLY ? _O_RDONLY :
+                      (flags & LX_O_ACCMODE) == LX_O_WRONLY ? _O_WRONLY :
+                      _O_RDWR;
+
+            fds[fd].host = _open_osfhandle((intptr_t)h, acc | _O_BINARY);
+            if (fds[fd].host < 0) {
+                memset(&fds[fd], 0, sizeof(fds[fd]));
+            }
+        }
+    }
+}
+
+/* execve: what this process had goes, the new program has its own */
+void w32u_fds_close_all(void)
+{
+    int fd;
+
+    for (fd = 0; fd < W32U_MAX_FDS; fd++) {
+        if (fds[fd].kind != FD_FREE) {
+            release_fd(&fds[fd]);
+        }
+    }
+}
+
+void w32u_syscall_init_launch(const char *exec_path, const char *spec)
+{
+    w32u_syscall_init(exec_path);
+    if (spec) {
+        int fd;
+
+        /* the guest's descriptors, not the host stdio */
+        for (fd = 0; fd < 3; fd++) {
+            memset(&fds[fd], 0, sizeof(fds[fd]));
+        }
+        fds_import(spec);
+    }
 }
 
 void w32u_syscall_init(const char *exec_path)

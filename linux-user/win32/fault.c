@@ -93,8 +93,11 @@ void w32u_die_with_signal(int sig)
     fprintf(stderr, "qemu: uncaught target signal %d (%s) - core dumped\n",
             sig, signal_name(sig));
     fflush(NULL);
-    /* the shell convention for "killed by signal N" */
-    ExitProcess(128 + sig);
+    /*
+     * a parent that is qemu-ARCH.exe sees the signal in the status; for
+     * the others, the shell convention for "killed by signal N"
+     */
+    ExitProcess(w32u_qemu_parent ? 0x40000000 | sig : 128 + sig);
 }
 
 static void G_NORETURN guest_segv_trampoline(void)

@@ -54,7 +54,7 @@ static QemuMutex clone_lock;
 
 abi_long w32u_gettid(void)
 {
-    return thread_tid ? thread_tid : GetCurrentProcessId();
+    return thread_tid ? thread_tid : w32u_vpid;
 }
 
 abi_long w32u_set_tid_address(abi_ulong addr)

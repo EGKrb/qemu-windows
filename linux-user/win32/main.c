@@ -220,6 +220,8 @@ int main(int argc, char **argv)
     W32UImage image;
     CPUState *cpu;
     int optind, i, ret;
+    /* started by execve() or fork() of a guest: what to run is there */
+    W32ULaunch *launch = w32u_launch_read();
 
     /* UTF-8 arguments, whatever the ANSI code page */
     argv = g_win32_get_command_line();
@@ -230,10 +232,21 @@ int main(int argc, char **argv)
     qemu_init_cpu_list();
     module_call_init(MODULE_INIT_QOM);
 
-    target_env = g_get_environ();
     parse_env();
-    optind = parse_args(argc, argv, &target_env);
-    exec_path = argv[optind];
+    if (launch) {
+        target_env = g_strdupv((char **)launch->env->pdata);
+        argv = (char **)launch->args->pdata;
+        argc = launch->args->len - 1;
+        optind = 0;
+        exec_path = launch->path;
+        if (launch->sysroot) {
+            w32u_sysroot = launch->sysroot;
+        }
+    } else {
+        target_env = g_get_environ();
+        optind = parse_args(argc, argv, &target_env);
+        exec_path = argv[optind];
+    }
 
     qemu_set_log_filename_flags(log_filename,
                                 log_mask | (w32u_strace ? LOG_STRACE : 0),
@@ -247,7 +260,9 @@ int main(int argc, char **argv)
     set_preferred_target_page_bits(ctz32(qemu_real_host_page_size()));
     finalize_target_page_bits();
 
-    w32u_cpu_type = parse_cpu_option(cpu_model ? cpu_model : "max");
+    w32u_cpu_type = launch && launch->cpu ? launch->cpu :
+                    parse_cpu_option(cpu_model ? cpu_model : "max");
+    w32u_process_init(launch);
     w32u_thread_init();
     cpu = cpu_create(w32u_cpu_type);
     cpu_reset(cpu);
@@ -256,7 +271,10 @@ int main(int argc, char **argv)
     w32u_mem_init();
     w32u_fault_init();
     init_random();
-    w32u_syscall_init(exec_path);
+    w32u_syscall_init_launch(exec_path, launch ? launch->fds : NULL);
+    if (launch && launch->fork) {
+        w32u_fork_child(launch, cpu);
+    }
 
     target_argv = g_new0(char *, argc - optind + 1);
     for (i = 0; optind + i < argc; i++) {

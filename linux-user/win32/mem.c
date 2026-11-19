@@ -293,6 +293,22 @@ void w32u_set_brk(abi_ulong brk)
     brk_page = TARGET_PAGE_ALIGN(brk);
 }
 
+void w32u_mem_get_state(abi_ulong st[4])
+{
+    st[0] = initial_brk;
+    st[1] = target_brk;
+    st[2] = brk_page;
+    st[3] = mmap_next_start;
+}
+
+void w32u_mem_set_state(const abi_ulong st[4])
+{
+    initial_brk = st[0];
+    target_brk = st[1];
+    brk_page = st[2];
+    mmap_next_start = st[3];
+}
+
 abi_ulong w32u_brk(abi_ulong new_brk)
 {
     abi_ulong new_page;
