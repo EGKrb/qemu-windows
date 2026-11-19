@@ -45,7 +45,7 @@ bool w32u_qemu_parent;
 enum {
     L_ARG = 1, L_ENV, L_FDS, L_VPID, L_PPID, L_SYSROOT, L_CPU, L_PATH,
     L_FORK_PARENT = 20, L_FORK_BASE, L_REGION, L_MEMSTATE, L_ENVBYTES,
-    L_FORK_EVENT, L_CLONE,
+    L_FORK_EVENT, L_CLONE, L_SIGNALS,
 };
 
 static void put_rec(GByteArray *b, uint32_t tag, const void *data,
@@ -166,6 +166,11 @@ W32ULaunch *w32u_launch_read(void)
         case L_CLONE:
             memcpy(l->clone, d, MIN(len, sizeof(l->clone)));
             break;
+        case L_SIGNALS:
+            if (len == sizeof(W32USignalState)) {
+                l->signals = g_memdup2(d, len);
+            }
+            break;
         }
         q = d + len;
     }
@@ -187,9 +192,18 @@ typedef struct Child {
 static GArray *children;            /* Child */
 static QemuMutex children_lock;
 
+static VOID CALLBACK child_ended(PVOID opaque, BOOLEAN timeout)
+{
+    w32u_raise_process(17);                 /* SIGCHLD */
+}
+
 static void child_add(abi_long pid, HANDLE process)
 {
     Child c = { pid, process };
+    HANDLE wait;
+
+    RegisterWaitForSingleObject(&wait, process, child_ended, NULL, INFINITE,
+                                WT_EXECUTEONLYONCE);
 
     qemu_mutex_lock(&children_lock);
     g_array_append_val(children, c);
@@ -272,6 +286,11 @@ abi_long w32u_wait4(abi_long pid, abi_ulong status_addr, int options,
 
 static void common_records(GByteArray *b)
 {
+    W32USignalState sigs;
+
+    /* the actions and the mask: execve keeps the ignored ones */
+    w32u_signal_export(&sigs);
+    put_rec(b, L_SIGNALS, &sigs, sizeof(sigs));
     if (w32u_sysroot) {
         put_str(b, L_SYSROOT, w32u_sysroot);
     }
@@ -688,9 +707,4 @@ void w32u_process_init(W32ULaunch *l)
     qemu_mutex_init(&children_lock);
     w32u_vpid = l && l->vpid ? l->vpid : GetCurrentProcessId();
     w32u_vppid = l && l->ppid ? l->ppid : 1;
-}
-
-void w32u_become_proxy(void)
-{
-    /* signals: see signal.c */
 }

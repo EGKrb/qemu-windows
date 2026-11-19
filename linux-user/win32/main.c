@@ -263,6 +263,7 @@ int main(int argc, char **argv)
     w32u_cpu_type = launch && launch->cpu ? launch->cpu :
                     parse_cpu_option(cpu_model ? cpu_model : "max");
     w32u_process_init(launch);
+    w32u_signal_init(launch);
     w32u_thread_init();
     cpu = cpu_create(w32u_cpu_type);
     cpu_reset(cpu);

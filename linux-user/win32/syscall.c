@@ -1038,7 +1038,17 @@ static abi_long do_write(GuestFD *f, abi_ulong buf, abi_ulong len)
         return -LX_EFAULT;
     }
     n = _write(f->host, p, len);
-    return n < 0 ? -lx_errno(errno) : n;
+    if (n < 0) {
+        DWORD e = GetLastError();
+
+        /* a pipe without reader: EPIPE, and SIGPIPE to this thread */
+        if (errno == EPIPE || e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE) {
+            w32u_raise_thread(13, 0, 0);
+            return -LX_EPIPE;
+        }
+        return -lx_errno(errno);
+    }
+    return n;
 }
 
 static abi_long do_rw_vec(int fd, abi_ulong iovaddr, abi_long cnt, bool is_write)
@@ -1700,11 +1710,19 @@ static abi_long get_timespec_ns(abi_ulong addr, int64_t *ns)
     return 0;
 }
 
-static void sleep_ns(int64_t ns)
+/* false when a signal came first */
+static bool sleep_ns(int64_t ns)
 {
-    if (ns > 0) {
-        g_usleep(DIV_ROUND_UP(ns, 1000));
+    int64_t end = get_clock() + ns;
+
+    while (ns > 0) {
+        if (w32u_signal_pending()) {
+            return false;
+        }
+        g_usleep(MIN(DIV_ROUND_UP(ns, 1000), 20000));
+        ns = end - get_clock();
     }
+    return true;
 }
 
 static abi_long sys_clock_nanosleep(int clk, int flags, abi_ulong req,
@@ -1720,7 +1738,13 @@ static abi_long sys_clock_nanosleep(int clk, int flags, abi_ulong req,
     if (ret) {
         return ret;
     }
-    sleep_ns(flags & LX_TIMER_ABSTIME ? ns - now : ns);
+    if (!sleep_ns(flags & LX_TIMER_ABSTIME ? ns - now : ns)) {
+        /* a signal: what is left of the time */
+        if (rem && !(flags & LX_TIMER_ABSTIME)) {
+            put_timespec(rem, MAX(ns - (clock_ns(clk) - now), 0));
+        }
+        return -LX_EINTR;
+    }
     if (rem && !(flags & LX_TIMER_ABSTIME)) {
         put_timespec(rem, 0);
     }
@@ -1818,35 +1842,7 @@ static abi_long sys_sysinfo(abi_ulong addr)
     return put_guest(addr, &si, sizeof(si));
 }
 
-static abi_long sys_kill(int pid, int sig)
-{
-    if (pid != (int)GetCurrentProcessId() && pid != 0 && pid != -1) {
-        return -LX_ESRCH;
-    }
-    if (sig < 0 || sig > LX_NSIG) {
-        return -LX_EINVAL;
-    }
-    if (sig) {
-        /* default action; only fatal signals are emulated */
-        w32u_die_with_signal(sig);
-    }
-    return 0;
-}
 
-static abi_long sys_rt_sigaction(int sig, abi_ulong act, abi_ulong oact)
-{
-    if (sig < 1 || sig > LX_NSIG ||
-        (act && (sig == LX_SIGKILL || sig == LX_SIGSTOP))) {
-        return -LX_EINVAL;
-    }
-    if (oact) {
-        /* struct sigaction: handler SIG_DFL, flags, restorer, mask */
-        uint64_t sa[4] = { 0 };
-
-        return put_guest(oact, sa, sizeof(sa));
-    }
-    return 0;
-}
 
 static abi_long sys_prctl(int option, abi_ulong arg2)
 {
@@ -1923,6 +1919,28 @@ static abi_long sys_statfs(bool by_fd, abi_ulong arg, abi_ulong buf)
     s.f_fsid[0] = serial;
     s.f_namelen = 255;
     return put_guest(buf, &s, sizeof(s));
+}
+
+static bool restartable(int num)
+{
+    switch (num) {
+    case TARGET_NR_rt_sigsuspend:
+    case TARGET_NR_nanosleep:
+    case TARGET_NR_clock_nanosleep:
+    case TARGET_NR_ppoll:
+    case TARGET_NR_pselect6:
+#ifdef TARGET_NR_pause
+    case TARGET_NR_pause:
+#endif
+#ifdef TARGET_NR_poll
+    case TARGET_NR_poll:
+#endif
+#ifdef TARGET_NR_select
+    case TARGET_NR_select:
+#endif
+        return false;
+    }
+    return true;
 }
 
 static G_NORETURN void do_exit(int status)
@@ -2274,6 +2292,10 @@ static abi_long x86_64_legacy(CPUArchState *env, int num, abi_long arg1,
     }
     case TARGET_NR_getpgrp:
         return w32u_vpid;
+    case TARGET_NR_pause:
+        return w32u_pause();
+    case TARGET_NR_alarm:
+        return w32u_alarm(arg1);
     case TARGET_NR_fork:
     case TARGET_NR_vfork:
         return w32u_fork(env, 0, 0, 0, 0, 0);
@@ -2592,29 +2614,27 @@ static abi_long do_syscall(CPUArchState *env, int num, abi_long arg1,
     case TARGET_NR_futex:
         return w32u_futex(arg1, arg2, arg3, arg4, arg5, arg6);
     case TARGET_NR_kill:
-        return sys_kill(arg1, arg2);
+        return w32u_kill(arg1, arg2);
     case TARGET_NR_tkill:
-        return sys_kill(arg1, arg2);
+        return w32u_tgkill(-1, arg1, arg2);
     case TARGET_NR_tgkill:
-        return arg1 == GetCurrentProcessId() ? sys_kill(arg2, arg3)
-                                            : -LX_ESRCH;
+        return w32u_tgkill(arg1, arg2, arg3);
     case TARGET_NR_rt_sigaction:
-        return sys_rt_sigaction(arg1, arg2, arg3);
+        return w32u_rt_sigaction(arg1, arg2, arg3);
+    case TARGET_NR_rt_sigreturn:
+        return w32u_sigreturn(env);
+    case TARGET_NR_rt_sigpending:
+        return w32u_rt_sigpending(arg1);
+    case TARGET_NR_setitimer:
+        return w32u_setitimer(arg1, arg2, arg3);
+    case TARGET_NR_getitimer:
+        return w32u_setitimer(arg1, 0, arg2);
+    case TARGET_NR_rt_sigsuspend:
+        return w32u_rt_sigsuspend(arg1);
     case TARGET_NR_rt_sigprocmask:
-        if (arg3) {
-            uint64_t empty = 0;
-
-            return put_guest(arg3, &empty, sizeof(empty));
-        }
-        return 0;
+        return w32u_rt_sigprocmask(arg1, arg2, arg3);
     case TARGET_NR_sigaltstack:
-        if (arg2) {
-            /* stack_t: ss_sp, ss_flags = SS_DISABLE, ss_size */
-            uint64_t ss[3] = { 0, 2, 0 };
-
-            return put_guest(arg2, ss, sizeof(ss));
-        }
-        return 0;
+        return w32u_sigaltstack(arg1, arg2, env);
 
     case TARGET_NR_clone:
         /* the order of x86_64; the others: flags, sp, ptid, tls, ctid */
@@ -2667,6 +2687,13 @@ abi_long w32u_syscall(CPUArchState *env, int num, abi_long arg1,
         }
     }
     ret = do_syscall(env, num, arg1, arg2, arg3, arg4, arg5, arg6);
+    /*
+     * interrupted by a signal whose handler has SA_RESTART: again, but
+     * the calls Linux never restarts (they wait for a signal or a time)
+     */
+    if (ret == -LX_EINTR && restartable(num)) {
+        ret = w32u_syscall_restart(ret);
+    }
     if (w32u_strace) {
         if (ret < 0 && ret >= -4095) {
             qemu_log(" = -1 errno=" TARGET_ABI_FMT_ld "\n", -ret);

@@ -128,6 +128,52 @@ G_NORETURN void w32u_exit_thread(int status);
 void w32u_clone_regs(CPUArchState *env, abi_ulong newsp, bool settls,
                      abi_ulong tls);
 
+/* signal.c */
+typedef struct W32USigAction {      /* struct sigaction of the kernel */
+    abi_ulong handler;
+    abi_ulong flags;
+    abi_ulong restorer;
+    uint64_t mask;
+} W32USigAction;
+typedef struct W32USigInfo {
+    int signo;
+    int code;
+    abi_ulong addr;
+    int pid;
+} W32USigInfo;
+typedef struct W32USignalState {
+    W32USigAction act[65];
+    uint64_t mask;
+} W32USignalState;
+/* syscall results for cpu_loop: run it again; the registers are set */
+#define W32U_ERESTART       (-512)
+#define W32U_ESIGRETURN     (-513)
+void w32u_signal_export(W32USignalState *s);
+void w32u_raise_process(int sig);
+void w32u_raise_thread(int sig, int code, abi_ulong addr);
+void w32u_force_signal(int sig, int code, abi_ulong addr);
+void w32u_handle_signals(CPUArchState *env);
+bool w32u_on_alt_stack(CPUArchState *env);
+abi_long w32u_syscall_restart(abi_long ret);
+abi_long w32u_sigreturn(CPUArchState *env);
+abi_long w32u_rt_sigaction(int sig, abi_ulong act, abi_ulong oact);
+abi_long w32u_rt_sigprocmask(int how, abi_ulong set, abi_ulong oset);
+abi_long w32u_rt_sigpending(abi_ulong set);
+abi_long w32u_rt_sigsuspend(abi_ulong set);
+abi_long w32u_pause(void);
+abi_long w32u_sigaltstack(abi_ulong ss, abi_ulong oss, CPUArchState *env);
+abi_long w32u_kill(abi_long pid, int sig);
+abi_long w32u_tgkill(abi_long tgid, abi_long tid, int sig);
+abi_long w32u_alarm(unsigned sec);
+abi_long w32u_setitimer(int which, abi_ulong val, abi_ulong old);
+/* cpu_loop-<target>.c: the signal frames */
+abi_ulong w32u_stack_pointer(CPUArchState *env);
+bool w32u_setup_frame(CPUArchState *env, int sig, const W32USigInfo *info,
+                      const W32USigAction *act, uint64_t old_mask,
+                      abi_ulong sp, abi_ulong ss_sp, abi_ulong ss_size,
+                      int ss_flags);
+bool w32u_restore_frame(CPUArchState *env, uint64_t *mask);
+
 /* process.c: execve, fork, wait4 */
 typedef struct W32ULaunch {
     GPtrArray *args, *env;          /* of the guest, NULL-terminated */
@@ -141,7 +187,9 @@ typedef struct W32ULaunch {
     uint8_t *envbytes;
     size_t envlen;
     uint64_t clone[4];              /* newsp, settls, tls */
+    W32USignalState *signals;
 } W32ULaunch;
+void w32u_signal_init(const W32ULaunch *l);
 extern abi_long w32u_vpid, w32u_vppid;
 extern bool w32u_qemu_parent;
 W32ULaunch *w32u_launch_read(void);
