@@ -38,6 +38,12 @@
 #include "qemu/cutils.h"
 #include "qemu/sockets.h"
 #include "qemu/win32-fdpass.h"
+#include "hw/virtio/vhost.h"
+#include "net/vhost_net.h"
+#include "standard-headers/linux/virtio_net.h"
+#ifdef CONFIG_VHOST_KERNEL
+#include "hw/virtio/vhost-win32.h"
+#endif
 #include "qapi/error.h"
 #include "tap-win32-adapter.h"
 #include <windows.h>
@@ -119,6 +125,8 @@ typedef struct tap_win32_overlapped {
     tun_buffer_t* output_queue_back;
     HANDLE thread;
     volatile bool stopping;
+    volatile bool paused;       /* vhost-net reads and writes the device */
+    HANDLE resume_event;
 } tap_win32_overlapped_t;
 
 static tun_buffer_t* get_buffer_from_free_list(tap_win32_overlapped_t* const overlapped)
@@ -524,6 +532,10 @@ static DWORD WINAPI tap_win32_thread_entry(LPVOID param)
 
 
     while (!overlapped->stopping) {
+        if (overlapped->paused) {
+            WaitForSingleObject(overlapped->resume_event, INFINITE);
+            continue;
+        }
         result = ReadFile(overlapped->handle,
                           buffer->buffer,
                           sizeof(buffer->buffer),
@@ -560,6 +572,9 @@ static DWORD WINAPI tap_win32_thread_entry(LPVOID param)
 
         if (overlapped->stopping) {
             break;
+        }
+        if (overlapped->paused) {
+            continue;
         }
         if(read_size > 0) {
             buffer->read_size = read_size;
@@ -625,6 +640,7 @@ static tap_win32_overlapped_t *tap_win32_start(HANDLE handle, Error **errp)
     }
     ov = g_new0(tap_win32_overlapped_t, 1);
     tap_win32_overlapped_init(ov, handle);
+    ov->resume_event = CreateEvent(NULL, FALSE, FALSE, NULL);
     ov->thread = CreateThread(NULL, 0, tap_win32_thread_entry, ov, 0, NULL);
     return ov;
 }
@@ -633,6 +649,8 @@ static void tap_win32_stop(tap_win32_overlapped_t *ov)
 {
     qemu_exit_debug("tap: stop the reader");
     ov->stopping = true;
+    ov->paused = false;
+    SetEvent(ov->resume_event);
     CancelIoEx(ov->handle, NULL);
     /* a thread waiting for a free buffer */
     ReleaseSemaphore(ov->free_list_semaphore, 1, NULL);
@@ -653,6 +671,7 @@ static void tap_win32_stop(tap_win32_overlapped_t *ov)
     CloseHandle(ov->output_queue_semaphore);
     CloseHandle(ov->free_list_semaphore);
     CloseHandle(ov->tap_semaphore);
+    CloseHandle(ov->resume_event);
     DeleteCriticalSection(&ov->output_queue_cs);
     DeleteCriticalSection(&ov->free_list_cs);
     g_free(ov);
@@ -667,7 +686,30 @@ typedef struct TAPState {
     char down_script[1024];
     char *created_guid;     /* the adapter made for this netdev */
     HANDLE helper;          /* qemu-bridge-helper, while the TAP is used */
+    VHostNetState *vhost_net;
 } TAPState;
+
+#ifdef CONFIG_VHOST_KERNEL
+/* the features vhost-net may take from the guest: see net/tap.c */
+static const int kernel_feature_bits[] = {
+    VIRTIO_F_NOTIFY_ON_EMPTY,
+    VIRTIO_RING_F_INDIRECT_DESC,
+    VIRTIO_RING_F_EVENT_IDX,
+    VIRTIO_NET_F_MRG_RXBUF,
+    VIRTIO_F_VERSION_1,
+    VIRTIO_NET_F_MTU,
+    VIRTIO_F_IOMMU_PLATFORM,
+    VIRTIO_F_RING_PACKED,
+    VIRTIO_F_RING_RESET,
+    VIRTIO_F_IN_ORDER,
+    VIRTIO_F_NOTIFICATION_DATA,
+    VIRTIO_NET_F_RSC_EXT,
+    VIRTIO_NET_F_HASH_REPORT,
+    VIRTIO_NET_F_GUEST_UDP_TUNNEL_GSO,
+    VIRTIO_NET_F_HOST_UDP_TUNNEL_GSO,
+    VHOST_INVALID_FEATURE_BIT
+};
+#endif
 
 /* Run @script with @ifname, as launch_script() of net/tap.c */
 static int tap_win32_run_script(const char *script, const char *ifname,
@@ -730,6 +772,11 @@ static void tap_cleanup(NetClientState *nc)
     TAPState *s = DO_UPCAST(TAPState, nc, nc);
     Error *err = NULL;
 
+    if (s->vhost_net) {
+        vhost_net_cleanup(s->vhost_net);
+        g_free(s->vhost_net);
+        s->vhost_net = NULL;
+    }
     if (!s->handle) {
         return;
     }
@@ -788,12 +835,113 @@ static void tap_win32_send(void *opaque)
     }
 }
 
+/* vhost-net reads the device while it runs: the reader thread waits */
+static void tap_win32_poll(NetClientState *nc, bool enable)
+{
+    TAPState *s = DO_UPCAST(TAPState, nc, nc);
+    tap_win32_overlapped_t *ov = s->handle;
+
+    if (!ov) {
+        return;
+    }
+    if (enable) {
+        ov->paused = false;
+        SetEvent(ov->resume_event);
+    } else {
+        ov->paused = true;
+        CancelIoEx(ov->handle, &ov->read_overlapped);
+    }
+}
+
+static VHostNetState *tap_get_vhost_net(NetClientState *nc)
+{
+    TAPState *s = DO_UPCAST(TAPState, nc, nc);
+
+    assert(nc->info->type == NET_CLIENT_DRIVER_TAP);
+    return s->vhost_net;
+}
+
 static NetClientInfo net_tap_win32_info = {
     .type = NET_CLIENT_DRIVER_TAP,
     .size = sizeof(TAPState),
     .receive = tap_receive,
     .cleanup = tap_cleanup,
+    .poll = tap_win32_poll,
+    .get_vhost_net = tap_get_vhost_net,
 };
+
+/*
+ * vhost-net: vhost=on opens the device of the vhost-net driver of Windows
+ * (\\.\vhost-net), vhostfd= is its handle inherited; -1 without vhost
+ */
+static HANDLE tap_win32_handle_arg(const char *str, Error **errp);
+
+static int tap_win32_vhost_fd(const NetdevTapOptions *tap, Error **errp)
+{
+    bool need = tap->has_vhost ? tap->vhost :
+                (tap->vhostfd || tap->vhostfds ||
+                 (tap->has_vhostforce && tap->vhostforce));
+    HANDLE h;
+    int fd;
+
+    if (!need) {
+        return -1;
+    }
+#ifdef CONFIG_VHOST_KERNEL
+    if (tap->vhostfd || tap->vhostfds) {
+        h = tap_win32_handle_arg(tap->vhostfd ?: tap->vhostfds, errp);
+        if (!h) {
+            return -2;
+        }
+    } else {
+        h = CreateFileA(VHOST_WIN32_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE,
+                        0, NULL, OPEN_EXISTING, 0, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            error_setg_win32(errp, GetLastError(),
+                             "could not open %s (is the vhost-net driver "
+                             "of Windows installed?)",
+                             VHOST_WIN32_DEVICE_NAME);
+            return -2;
+        }
+    }
+    fd = _open_osfhandle((intptr_t)h, _O_BINARY);
+    if (fd < 0) {
+        CloseHandle(h);
+        error_setg(errp, "invalid vhost-net handle");
+        return -2;
+    }
+    return fd;
+#else
+    error_setg(errp, "vhost-net support was not built");
+    return -2;
+#endif
+}
+
+/* the TAP is ready: vhost-net on it if asked, as net_init_tap_one() */
+static int tap_win32_finish(TAPState *s, int vhostfd, uint32_t poll_us,
+                            Error **errp)
+{
+#ifdef CONFIG_VHOST_KERNEL
+    VhostNetOptions options = { 0 };
+
+    if (vhostfd < 0) {
+        return 0;
+    }
+    options.backend_type = VHOST_BACKEND_TYPE_KERNEL;
+    options.net_backend = &s->nc;
+    options.busyloop_timeout = poll_us;
+    options.opaque = (void *)(uintptr_t)vhostfd;
+    options.nvqs = 2;
+    options.feature_bits = kernel_feature_bits;
+    options.is_vhost_user = false;
+    s->vhost_net = vhost_net_init(&options);
+    if (!s->vhost_net) {
+        error_setg(errp, "vhost-net requested but could not be initialized");
+        return -1;
+    }
+#endif
+    return 0;
+}
 
 static TAPState *tap_win32_new(NetClientState *peer, const char *model,
                                const char *name, HANDLE handle,
@@ -1018,6 +1166,7 @@ int net_init_tap(const Netdev *netdev, const char *name,
     char *created = NULL;
     HANDLE handle = NULL, helper_process = NULL;
     TAPState *s;
+    int vhostfd;
 
     assert(netdev->type == NET_CLIENT_DRIVER_TAP);
     tap = &netdev->u.tap;
@@ -1026,12 +1175,8 @@ int net_init_tap(const Netdev *netdev, const char *name,
         error_setg(errp, "vnet_hdr=on is not supported by TAP-Windows");
         return -1;
     }
-    if (tap->has_vhost && tap->vhost) {
-        error_setg(errp, "vhost=on needs the vhost-net driver of Windows");
-        return -1;
-    }
-    if (tap->vhostfd || tap->vhostfds) {
-        error_setg(errp, "vhostfd= needs the vhost-net driver of Windows");
+    if (tap->vhostfds && strchr(tap->vhostfds, ':')) {
+        error_setg(errp, "TAP-Windows has one queue: one handle in vhostfds");
         return -1;
     }
     if (tap->has_queues && tap->queues > 1) {
@@ -1043,44 +1188,49 @@ int net_init_tap(const Netdev *netdev, const char *name,
         return -1;
     }
 
+    vhostfd = tap_win32_vhost_fd(tap, errp);
+    if (vhostfd == -2) {
+        return -1;
+    }
+
     if (tap->fd || tap->fds) {
         /* a TAP device opened by the parent process, inherited */
         if (tap->ifname || tap->script || tap->downscript || tap->helper) {
             error_setg(errp, "ifname=, script=, downscript= and helper= are "
                        "invalid with fd=");
-            return -1;
+            goto fail_vhost;
         }
         handle = tap_win32_handle_arg(tap->fd ? tap->fd : tap->fds, errp);
         if (!handle) {
-            return -1;
+            goto fail_vhost;
         }
         s = tap_win32_new(peer, "tap", name, handle, NULL, errp);
         if (!s) {
-            return -1;
+            goto fail_vhost;
         }
         qemu_set_info_str(&s->nc, "fd=%s", tap->fd ? tap->fd : tap->fds);
-        return 0;
+        goto finish;
     }
 
     if (tap->helper) {
         if (tap->ifname || tap->script || tap->downscript) {
             error_setg(errp, "ifname=, script= and downscript= are invalid "
                        "with helper=");
-            return -1;
+            goto fail_vhost;
         }
         handle = tap_win32_run_helper(tap->helper, tap->br ?: "br0",
                                       &helper_process, errp);
         if (!handle) {
-            return -1;
+            goto fail_vhost;
         }
         s = tap_win32_new(peer, "tap", name, handle, NULL, errp);
         if (!s) {
             CloseHandle(helper_process);
-            return -1;
+            goto fail_vhost;
         }
         s->helper = helper_process;
         qemu_set_info_str(&s->nc, "helper=%s", tap->helper);
-        return 0;
+        goto finish;
     }
 
     if (tap->ifname) {
@@ -1088,14 +1238,14 @@ int net_init_tap(const Netdev *netdev, const char *name,
         if (!guid) {
             error_setg(errp, "no TAP-Windows adapter named '%s'",
                        tap->ifname);
-            return -1;
+            goto fail_vhost;
         }
         ifname = g_strdup(tap->ifname);
     } else {
         /* as Linux makes tapN: a new adapter, removed at the end */
         guid = tap_win32_adapter_create(NULL, &ifname, errp);
         if (!guid) {
-            return -1;
+            goto fail_vhost;
         }
         created = g_strdup(guid);
     }
@@ -1122,12 +1272,24 @@ int net_init_tap(const Netdev *netdev, const char *name,
     }
     qemu_set_info_str(&s->nc, "ifname=%s,script=%s,downscript=%s", ifname,
                       script ?: "no", downscript ?: "no");
+
+finish:
+    if (tap_win32_finish(s, vhostfd, tap->has_poll_us ? tap->poll_us : 0,
+                         errp) < 0) {
+        /* the netdev goes: with its TAP, as when QEMU stops */
+        qemu_del_net_client(&s->nc);
+        return -1;
+    }
     return 0;
 
 fail:
     if (created) {
         tap_win32_adapter_remove(created, NULL);
         g_free(created);
+    }
+fail_vhost:
+    if (vhostfd >= 0) {
+        close(vhostfd);
     }
     return -1;
 }
@@ -1164,10 +1326,13 @@ int net_init_bridge(const Netdev *netdev, const char *name,
     return 0;
 }
 
-/* the descriptor of a TAP device for vhost-net: see net/tap.c */
+/* the TAP device for vhost-net (VHOST_NET_SET_BACKEND): its handle */
 int tap_get_fd(NetClientState *nc)
 {
-    return -1;
+    TAPState *s = DO_UPCAST(TAPState, nc, nc);
+
+    assert(nc->info->type == NET_CLIENT_DRIVER_TAP);
+    return s->handle ? w32fd_handle_token(s->handle->handle) : -1;
 }
 
 /* one queue: always enabled */

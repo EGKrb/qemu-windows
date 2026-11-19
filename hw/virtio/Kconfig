@@ -89,7 +89,7 @@ config VHOST_VSOCK
     bool
     default y
     select VHOST_VSOCK_COMMON
-    depends on VIRTIO && VHOST_KERNEL
+    depends on VIRTIO && VHOST_KERNEL && LINUX
 
 config VHOST_USER_VSOCK
     bool

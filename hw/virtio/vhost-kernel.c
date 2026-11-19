@@ -17,14 +17,94 @@
 
 #include "hw/virtio/vhost-vdpa.h"
 #ifdef CONFIG_VHOST_KERNEL
+#ifdef _WIN32
+#include "hw/virtio/vhost-win32.h"
+#include "qemu/win32-fdpass.h"
+#else
 #include <linux/vhost.h>
 #include <sys/ioctl.h>
+#endif
 
 struct vhost_features {
     uint64_t count;
     uint64_t features[VIRTIO_FEATURES_NU64S];
 };
 
+#ifdef _WIN32
+/* a descriptor or handle token of QEMU -> the handle, for the driver */
+static int vhost_win32_handle(int fd)
+{
+    if (fd == -1) {
+        return -1;
+    }
+    if (w32fd_is_token(fd)) {
+        return (int)(intptr_t)w32fd_token_handle(fd);
+    }
+    return (int)_get_osfhandle(fd);
+}
+
+/*
+ * Windows: the request goes to the driver (\\.\vhost-net) as a
+ * DeviceIoControl() with the same argument; descriptors in it become
+ * handles of this process, which the driver references
+ */
+static int vhost_kernel_call(struct vhost_dev *dev, unsigned long int request,
+                             void *arg)
+{
+    int fd = (uintptr_t) dev->opaque;
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    DWORD size = _IOC_SIZE(request), got = 0;
+    struct vhost_vring_file file;
+
+    assert(dev->vhost_ops->backend_type == VHOST_BACKEND_TYPE_KERNEL);
+
+    switch (request) {
+    case VHOST_SET_MEM_TABLE:
+        size = sizeof(struct vhost_memory) +
+               ((struct vhost_memory *)arg)->nregions *
+               sizeof(struct vhost_memory_region);
+        break;
+    case VHOST_GET_FEATURES_ARRAY:
+    case VHOST_SET_FEATURES_ARRAY:
+        size = sizeof(uint64_t) + ((struct vhost_features_array *)arg)->count *
+               sizeof(uint64_t);
+        break;
+    case VHOST_SET_VRING_KICK:
+    case VHOST_SET_VRING_CALL:
+    case VHOST_SET_VRING_ERR:
+    case VHOST_NET_SET_BACKEND:
+        file = *(struct vhost_vring_file *)arg;
+        file.fd = vhost_win32_handle(file.fd);
+        arg = &file;
+        break;
+    case VHOST_SET_LOG_FD:
+        /* the log is the memory given by VHOST_SET_LOG_BASE */
+        return 0;
+    }
+    if (!DeviceIoControl(h, VHOST_WIN32_CODE(request), arg, arg ? size : 0,
+                         arg, arg ? size : 0, &got, NULL)) {
+        switch (GetLastError()) {
+        case ERROR_INVALID_FUNCTION:
+        case ERROR_NOT_SUPPORTED:
+            return -ENOTTY;
+        case ERROR_INVALID_PARAMETER:
+            return -EINVAL;
+        case ERROR_INVALID_HANDLE:
+            return -EBADF;
+        case ERROR_NOT_ENOUGH_MEMORY:
+        case ERROR_NO_SYSTEM_RESOURCES:
+            return -ENOMEM;
+        case ERROR_BUSY:
+            return -EBUSY;
+        case ERROR_ACCESS_DENIED:
+            return -EPERM;
+        default:
+            return -EIO;
+        }
+    }
+    return 0;
+}
+#else
 static int vhost_kernel_call(struct vhost_dev *dev, unsigned long int request,
                              void *arg)
 {
@@ -36,6 +116,7 @@ static int vhost_kernel_call(struct vhost_dev *dev, unsigned long int request,
     ret = ioctl(fd, request, arg);
     return ret < 0 ? -errno : ret;
 }
+#endif
 
 static int vhost_kernel_init(struct vhost_dev *dev, void *opaque, Error **errp)
 {

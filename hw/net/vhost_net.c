@@ -352,7 +352,9 @@ static int vhost_net_start_one(struct vhost_net *net,
     }
 
     if (net->nc->info->type == NET_CLIENT_DRIVER_TAP) {
+#ifndef _WIN32
         qemu_set_fd_handler(net->backend, NULL, NULL, NULL);
+#endif
         file.fd = net->backend;
         for (file.index = 0; file.index < net->dev.nvqs; ++file.index) {
             if (!virtio_queue_enabled(dev, net->dev.vq_index +

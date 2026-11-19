@@ -61,7 +61,7 @@ config VHOST_SCSI
     bool
     default y
     select VHOST_SCSI_COMMON
-    depends on VIRTIO && VHOST_KERNEL
+    depends on VIRTIO && VHOST_KERNEL && LINUX
 
 config VHOST_USER_SCSI
     bool
