@@ -62,9 +62,11 @@ Windows does not have; what replaces it, if anything).
 | --- | --- |
 | user (slirp), socket, stream, dgram, hubport | same |
 | scsi-block, scsi-generic | **done** (VM test pending): SG_IO and the sg ioctls QEMU uses are IOCTL_SCSI_PASS_THROUGH_DIRECT and IOCTL_SCSI_GET_ADDRESS on `host_device` (`util/win32-sgio.c`, `include/scsi/sg-win32.h`); `\\.\PhysicalDriveN`, `\\.\CdRomN`, `\\.\TapeN`, `\\.\ChangerN` (tapes/changers are sg devices as /dev/sgN). Differences: no separate generic node on Windows (any pass-through device answers SG_GET_SCSI_ID); pass-through needs write access on Windows (not from root on Linux): a read-only device gets a second, read-write handle for SG_IO only (shared for reading, so nobody else writes), qemu-pr-helper gets the read-only one and refuses PR OUT on it as Linux does, PR IN on it = IOCTL_STORAGE_PERSISTENT_RESERVE_IN; qemu-pr-helper gives commands 30 s (Windows counts timeouts in seconds and resets the unit at expiry: 1 ms of upstream lost replies); administrator rights to open disks |
-| tap, bridge | **done** (VM test pending): `ifname=` an adapter by name; no `ifname=` = a new adapter tapN, removed at the end (SetupAPI root\tap0901, `net/tap-win32-adapter.c`); `script=`/`downscript=` (.ps1/.bat/.cmd/.exe, default `etc\qemu-ifup`/`qemu-ifdown` with any of these extensions, `no`); `fd=`/`fds=` = an inherited handle number (overlapped); `helper=` and `-netdev bridge` = qemu-bridge-helper (handle sent over a socket pair). One queue: `queues>1`, `vnet_hdr=on` refused; `vhost=` needs the vhost-net driver (**todo**) |
+| tap, bridge | **done** (VM test pending): `ifname=` an adapter by name; no `ifname=` = a new adapter tapN, removed at the end (SetupAPI root\tap0901, `net/tap-win32-adapter.c`); `script=`/`downscript=` (.ps1/.bat/.cmd/.exe, default `etc\qemu-ifup`/`qemu-ifdown` with any of these extensions, `no`); `fd=`/`fds=` = an inherited handle number (overlapped); `helper=` and `-netdev bridge` = qemu-bridge-helper (handle sent over a socket pair). One queue: `queues>1`, `vnet_hdr=on` refused; `vhost=on`/`vhostfd=`: the vhost-net driver of Windows (below) |
 | vhost-user | **done**: both ends of the AF_UNIX socket frame the stream and duplicate handles into the peer (`util/win32-fdpass.c`, as SCM_RIGHTS would pass descriptors); `contrib/vhost-user-bridge` ported (tested: ping through it) |
-| vhost-net, vhost-vdpa, af-xdp, netmap, passt, l2tpv3, vde | **no** (Linux kernel or Linux-only programs) |
+| vhost-net | **done**, VM test pending: `windows/drivers/vhost-net`, a WDM driver with the interface of /dev/vhost-net (requests of linux/vhost.h as DeviceIoControl codes on `\\.\vhost-net`, `include/hw/virtio/vhost-win32.h`), data path between the virtqueues and a TAP-Windows device in a kernel thread attached to QEMU; `windows/drivers/build.sh` builds it with MinGW and test-signs it |
+| passt (`-netdev passt`) | **done**: `contrib/passt-win32` (passt.exe), the command line and protocols of passt (`--fd`, `--vhost-user`, `--socket`, `-t`/`-u`, `--pid`, background) on libslirp; the guest has the host's address, gateway (the host's loopback), DNS, the LAN reachable; ARP and DHCP answered by it. Tested: stream and vhost-user modes (DHCP, loopback, forwarded port, DNS) |
+| vhost-vdpa, af-xdp, netmap, l2tpv3, vde | **no** (Linux kernel or Linux-only programs) |
 | `-netdev user,smb=` | **todo** |
 
 ## Devices and backends
@@ -72,7 +74,7 @@ Windows does not have; what replaces it, if anything).
 | Feature | Windows |
 | --- | --- |
 | virtio-9p (`-virtfs`, `-fsdev local`) | **done**, every security model: the `*at()` functions on NT's relative opens (`NtCreateFile` with a root directory), POSIX renames and deletions (a file deleted while open, as on Linux), owner/mode/device as WSL keeps them (`$LXUID`, `$LXGID`, `$LXMOD`, `$LXDEV`), symbolic links, FIFOs, sockets and device nodes as WSL's reparse points (no privilege), extended attributes as NTFS EAs, names NTFS refuses mapped to U+F0xx as WSL and Cygwin do, directories made by the guest case sensitive |
-| TPM (`tpm-tis`, `tpm-crb`...) | **done**, built. `tpm-passthrough`: the TPM of the host through the TPM Base Services (`path=tbs`), to be tested in a VM. `tpm-emulator`: **done** with swtpm for Windows (`windows/swtpm`: libtpms 0.10.1 built with MinGW, the `swtpm socket` command line and control protocol, state in `--tpmstate dir=`); tested: a Linux guest sees a TPM 2.0, TPM2_GetRandom, PCRs measured by the firmware |
+| TPM (`tpm-tis`, `tpm-crb`...) | **done**, built. `tpm-passthrough`: the TPM of the host through the TPM Base Services (`path=tbs`); VM test ready (the VM has a TPM 2.0 now). `tpm-emulator`: **done** with swtpm for Windows (`windows/swtpm`: libtpms 0.10.1 built with MinGW, the `swtpm socket` command line and control protocol, state in `--tpmstate dir=`); tested: a Linux guest sees a TPM 2.0, TPM2_GetRandom, PCRs measured by the firmware |
 | vfio, iommufd, vfio-user | **no** |
 | `input-linux`, `can-host-socketcan`, `pr-manager-helper` | **no** / **no** / **done** (VM test pending): the handle of the device goes to qemu-pr-helper in a frame (`qio_channel_socket_set_handle_passing`) |
 | `secret_keyring` | **todo** (Credential Manager) |
@@ -82,11 +84,11 @@ Windows does not have; what replaces it, if anything).
 | Program | Windows |
 | --- | --- |
 | qemu-system-*, qemu-img, qemu-io, qemu-nbd, qemu-storage-daemon, qemu-ga, elf2dmp | built |
-| linux-user (`qemu-ARCH`) | **todo**: a native prototype for aarch64; otherwise through WSL |
+| linux-user (`qemu-x86_64`, `qemu-aarch64`) | **done**, native (`linux-user/win32`, its own frontend on Windows APIs): static and dynamic programs (`-L`/`QEMU_LD_PREFIX`), threads and futexes, fork (the memory copied into a new process), vfork, posix_spawn, execve (#! scripts, other architectures), wait4, pipes, poll/select, signals between processes and to handlers (frames of x86_64 and AArch64), Ctrl-C, SIGPIPE, SIGCHLD. Ubuntu's bash, coreutils, grep, sed, awk run; test programs give the same results as on Linux |
 | bsd-user | **no** |
 | qemu-vnc | **done**: sockets given to QEMU as WSAPROTOCOL_INFOW (the Win32 D-Bus display API), Win32 map scanouts, AddClient; tested over a session bus |
 | qemu-bridge-helper, qemu-pr-helper, qemu-vmsr-helper, vhost-user backends of contrib | **done** (`qemu-bridge-helper-win32.c`: bridge.conf ACL, makes a TAP adapter, `netsh bridge add`, sends its handle, removes it when QEMU ends; needs administrator rights) / **done** (VM test pending: `scsi/qemu-pr-helper.c`, SG_IO of Windows on the handle QEMU sends; `--daemon` = os-win32-daemon.c; no multipath: device-mapper is Linux) / **no** / vhost-user-bridge done, others **todo** |
-| modules (`--enable-modules`) | **todo** (DLLs) |
+| modules (`--enable-modules`) | **done**: DLLs importing QEMU's symbols from "qemu-host.exe" (a delay-load import library made from what the executables export), bound by their entry point to the executable that loads them and to the modules loaded before; all 30 modules load, modules-test 7/7. Also fixed: curl, libnfs and libssh give or take sockets (SOCKET), the event loop descriptors |
 
 ## Tests of QEMU on Windows (qtests)
 
