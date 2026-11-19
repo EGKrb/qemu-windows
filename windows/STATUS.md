@@ -75,7 +75,7 @@ Windows does not have; what replaces it, if anything).
 | --- | --- |
 | virtio-9p (`-virtfs`, `-fsdev local`) | **done**, every security model: the `*at()` functions on NT's relative opens (`NtCreateFile` with a root directory), POSIX renames and deletions (a file deleted while open, as on Linux), owner/mode/device as WSL keeps them (`$LXUID`, `$LXGID`, `$LXMOD`, `$LXDEV`), symbolic links, FIFOs, sockets and device nodes as WSL's reparse points (no privilege), extended attributes as NTFS EAs, names NTFS refuses mapped to U+F0xx as WSL and Cygwin do, directories made by the guest case sensitive |
 | TPM (`tpm-tis`, `tpm-crb`...) | **done**, built. `tpm-passthrough`: the TPM of the host through the TPM Base Services (`path=tbs`); VM test ready (the VM has a TPM 2.0 now). `tpm-emulator`: **done** with swtpm for Windows (`windows/swtpm`: libtpms 0.10.1 built with MinGW, the `swtpm socket` command line and control protocol, state in `--tpmstate dir=`); tested: a Linux guest sees a TPM 2.0, TPM2_GetRandom, PCRs measured by the firmware |
-| vfio, iommufd, vfio-user | **no** |
+| vfio, iommufd, vfio-user | **no**, left out by choice (an IOMMU of type TYPE1 is needed: the DMA remapping interface of Windows drivers, missing here) |
 | `input-linux`, `can-host-socketcan`, `pr-manager-helper` | **no** / **no** / **done** (VM test pending): the handle of the device goes to qemu-pr-helper in a frame (`qio_channel_socket_set_handle_passing`) |
 | `secret_keyring` | **todo** (Credential Manager) |
 
